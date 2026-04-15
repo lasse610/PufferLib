@@ -55,13 +55,18 @@ PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_LIB=-lomp5
+    OMP_CFLAGS=(-fopenmp)
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
-    SANITIZE_FLAGS=()
+    # Apple clang needs explicit libomp paths; expects Homebrew libomp
+    LIBOMP_PREFIX="${LIBOMP_PREFIX:-/opt/homebrew/opt/libomp}"
+    OMP_CFLAGS=(-Xpreprocessor -fopenmp "-I${LIBOMP_PREFIX}/include" "-L${LIBOMP_PREFIX}/lib")
+    # Apple clang supports ASan + UBSan + bounds + pointer-overflow, but not leak.
+    SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
 fi
@@ -140,7 +145,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
         "${LINK_ARCHIVES[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread "${OMP_CFLAGS[@]}" $OMP_LIB
         -DPLATFORM_DESKTOP
     )
     echo "Compiling $ENV..."

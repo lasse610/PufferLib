@@ -170,5 +170,9 @@ pufferlib/ocean/impulse_wars/benchmark/
 
 # Data
 resources/drive/data/*
+
+# Standalone env binaries (compiled at repo root by build.sh --fast / --local)
+/labyrinth
+*.dSYM/
 resources/drive/binaries/*
 

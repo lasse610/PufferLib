@@ -1,0 +1,18 @@
+# Formatting for ocean/labyrinth/ only.
+# Matches the rough style of the rest of ocean/ envs: K&R-ish, 4-space indent,
+# 100-column line limit, braces on same line.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlignConsecutiveAssignments: None
+AlignTrailingComments: true
+PointerAlignment: Left
+SpaceBeforeParens: ControlStatements
+IncludeBlocks: Preserve
+SortIncludes: false
