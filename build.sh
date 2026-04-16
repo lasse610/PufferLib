@@ -225,7 +225,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    -fPIC "${OMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -266,7 +266,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC "${OMP_CFLAGS[@]}" \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -277,7 +277,7 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC "${OMP_CFLAGS[@]}"
         build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         -lm -lpthread $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
