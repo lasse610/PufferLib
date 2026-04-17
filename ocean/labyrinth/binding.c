@@ -25,5 +25,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "reached_goal", log->reached_goal);
     dict_set(out, "fell_in_hole", log->fell_in_hole);
+    dict_set(out, "avg_difficulty", log->avg_difficulty);
+    dict_set(out, "at_max_eps", log->at_max_eps);
+    dict_set(out, "at_max_solved", log->at_max_solved);
     dict_set(out, "n", log->n);
 }

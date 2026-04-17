@@ -412,11 +412,9 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_SHAPING_GAMMA 0.995f
 #define LABYRINTH_POTENTIAL_SCALE 3.0f
 
-// Flat per-step cost. Sized so stall-to-timeout has strictly worse
-// discounted return than falling quickly: with γ=0.995 and a -1 fall
-// terminal, stalling 2000 steps at 0.01/step yields discounted return
-// ≈ -2 vs a 100-step fall ≈ -1.4 — stalling is never the optimal option.
-#define LABYRINTH_STEP_PENALTY 0.01f
+// Flat per-step cost; max_steps × this must exceed the fall penalty so
+// stall-to-timeout is worse than falling.
+#define LABYRINTH_STEP_PENALTY 0.002f
 
 #define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
 
@@ -432,15 +430,22 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_CURRICULUM_WINDOW 0
 #define LABYRINTH_CURRICULUM_MAX_WINDOW 64
 #define LABYRINTH_CURRICULUM_THRESHOLD 0.5f
-#define LABYRINTH_CURRICULUM_STEP 0.05f
+#define LABYRINTH_CURRICULUM_STEP 0.02f
 
 typedef struct Log {
     float perf;           // normalized score in [0, 1]: 1.0 if reached goal
     float score;          // unnormalized: +1 reach, -1 fall, 0 timeout
     float episode_return; // sum of step rewards over episode
     float episode_length;
-    float reached_goal;   // counter: how many episodes ended at goal
-    float fell_in_hole;   // counter: how many ended in a hole
+    float reached_goal;   // fraction of episodes that solved
+    float fell_in_hole;   // fraction of episodes that fell
+    // Per-difficulty visibility. avg_difficulty is the mean curriculum
+    // difficulty seen across logged episodes. at_max_eps is the fraction
+    // of those at d ≥ 0.999. at_max_solved is the fraction solved AT max
+    // (out of all episodes — divide by at_max_eps for the conditional rate).
+    float avg_difficulty;
+    float at_max_eps;
+    float at_max_solved;
     float n;              // required last field: how many episodes logged
 } Log;
 
@@ -531,6 +536,10 @@ static inline void add_log(LabyrinthEnv* env) {
     env->log.episode_length += (float)env->tick;
     env->log.reached_goal += (float)won;
     env->log.fell_in_hole += (float)lost;
+    env->log.avg_difficulty += env->current_difficulty;
+    int at_max = (env->current_difficulty >= 0.999f);
+    env->log.at_max_eps += at_max ? 1.0f : 0.0f;
+    env->log.at_max_solved += (at_max && won) ? 1.0f : 0.0f;
     env->log.n += 1.0f;
 }
 
