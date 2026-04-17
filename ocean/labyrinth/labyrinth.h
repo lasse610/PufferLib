@@ -419,14 +419,27 @@ static inline void draw_board(const Labyrinth* env) {
 // designer's ideal polyline".
 #define LABYRINTH_SCALAR_FEATURES 8
 
-// Per-step shaping reward = (decrease in bfs_dist_norm) × this scale. Scaled
-// so a full start-to-goal traversal sums to ~this value over the episode.
-#define LABYRINTH_PROGRESS_REWARD_SCALE 0.5f
+// Potential-based reward shaping (Ng, Harada & Russell 1999):
+//   F(s, s') = γ_shaping · φ(s') − φ(s),   φ(terminal) ≡ 0
+// with potential
+//   φ(s) = LABYRINTH_POTENTIAL_SCALE · (1 − bfs_dist_norm(s))
+// so φ = k at the goal cell, 0 at the worst-reachable cell, ≥ 0 everywhere.
+//
+// Why this shape:
+//  - Sitting still pays F = (γ−1)·φ(s) ≤ 0 every step (worse the closer to
+//    goal the agent is) — kills the "go to a corner and time out" exploit.
+//  - Backtracking A→B→A nets negative: the discount makes the return trip
+//    cost more than the forward trip pays — kills oscillation farming.
+//  - Discounted cumulative shaping over an episode telescopes to −φ(s_0)
+//    (policy-invariant offset) once we force φ(terminal)=0; the sparse
+//    ±1 on goal/fall is still what the optimizer actually trades for.
+//
+// γ_shaping must match the training discount; bump together if either changes.
+#define LABYRINTH_SHAPING_GAMMA 0.995f
+#define LABYRINTH_POTENTIAL_SCALE 3.0f
 
-// Flat per-step cost. Prevents the "stall to timeout" exploit: without it,
-// the agent can grab early shaping and then sit still for the -1 fall
-// penalty to discount away. At 2000 max_steps this sums to -4.0 worst case,
-// which is worse than falling, so stalling is never optimal.
+// Flat per-step cost. Tiebreaker against shaping plateaus where φ doesn't
+// change much between cells; also a small extra push to terminate quickly.
 #define LABYRINTH_STEP_PENALTY 0.002f
 
 // Total observation size — must stay in sync with binding.c's OBS_SIZE.
@@ -440,6 +453,13 @@ static inline void draw_board(const Labyrinth* env) {
 // rate on top of the 200 Hz physics — human-ish reaction cadence and 4× more
 // simulated time per step, so a 2000-step episode = 40 s of real time.
 #define LABYRINTH_PHYSICS_SUBSTEPS 4
+
+// Curriculum defaults. `difficulty_start` is the floor (0=trivial, 1=full maze).
+// `curriculum_episodes` = 0 means no ramping — stay at `difficulty_start` the
+// whole run. >0 means each env ramps from `difficulty_start` up to 1.0 over its
+// own first N episodes, then stays at 1.0. Default keeps current behavior.
+#define LABYRINTH_DIFFICULTY_START 1.0f
+#define LABYRINTH_CURRICULUM_EPISODES 0
 
 typedef struct Log {
     float perf;           // normalized score in [0, 1]: 1.0 if reached goal
@@ -489,10 +509,16 @@ typedef struct LabyrinthEnv {
     // reset(). Max distance across the map is cached for normalization.
     unsigned short dist_to_goal[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
     int max_dist;                // largest reachable BFS distance (for normalization)
-    float min_dist_norm_seen;    // watermark: lowest (= best) dist_norm this episode.
-                                 // Shaping reward only pays out when a step sets a
-                                 // new best; backtracking earns 0, so oscillation
-                                 // can't be farmed under discounted returns.
+    float prev_dist_norm;        // last step's bfs_dist_norm — used to compute
+                                 // F = γ·φ(s') − φ(s) on the next step.
+
+    // Curriculum state. `episode_count` is this env's completed-episode counter.
+    // At each c_reset the difficulty passed to the maze generator is:
+    //   d = difficulty_start + (1 − difficulty_start) · min(1, ep / curr_eps)
+    // (or just difficulty_start if curriculum_episodes == 0).
+    int episode_count;
+    float difficulty_start;
+    int curriculum_episodes;
 } LabyrinthEnv;
 
 // Allocate per-agent buffers. Only needed for the standalone binary — the
@@ -525,6 +551,11 @@ static inline void init(LabyrinthEnv* env) {
     env->maze_seed = env->seed;
     env->episode_return = 0.0f;
     env->client = NULL;
+    env->episode_count = 0;
+    if (env->difficulty_start < 0.0f || env->difficulty_start > 1.0f)
+        env->difficulty_start = LABYRINTH_DIFFICULTY_START;
+    if (env->curriculum_episodes < 0)
+        env->curriculum_episodes = LABYRINTH_CURRICULUM_EPISODES;
 }
 
 // Log-aggregation helper called on terminal transitions.
@@ -717,14 +748,23 @@ static inline void c_reset(LabyrinthEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->maze_seed += 1u;
+    // Per-env curriculum: linear ramp in episode count from difficulty_start
+    // up to full difficulty (1.0) over curriculum_episodes episodes.
+    float difficulty = env->difficulty_start;
+    if (env->curriculum_episodes > 0) {
+        float progress = (float)env->episode_count / (float)env->curriculum_episodes;
+        if (progress > 1.0f) progress = 1.0f;
+        difficulty = env->difficulty_start + (1.0f - env->difficulty_start) * progress;
+    }
     labyrinth_reset(&env->phys);
-    labyrinth_load_random_maze(&env->phys, env->maze_seed);
+    labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, difficulty);
     build_grid(env);
     build_distance_field(env);
-    env->min_dist_norm_seen = labyrinth_dist_to_goal_norm(env);
+    env->prev_dist_norm = labyrinth_dist_to_goal_norm(env);
     compute_observations(env);
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0.0f;
+    env->episode_count += 1;
 }
 
 // Apply action, advance physics, compute reward/terminal/obs.
@@ -754,31 +794,24 @@ static inline void c_step(LabyrinthEnv* env) {
     }
     env->tick += 1;
 
-    // Dense shaping with monotone watermark: reward is (min_seen − current)
-    // when current beats the best dist-to-goal so far this episode, else 0.
-    // Backtracking earns 0 rather than negative, so the agent can't farm
-    // oscillation (discounted +δ,−δ pairs net positive otherwise). Max total
-    // shaping reward per episode is still LABYRINTH_PROGRESS_REWARD_SCALE.
-    float cur_dist_norm = labyrinth_dist_to_goal_norm(env);
-    float dist_delta = env->min_dist_norm_seen - cur_dist_norm; // positive = new best
-    if (dist_delta < 0.0f)
-        dist_delta = 0.0f;
-    if (cur_dist_norm < env->min_dist_norm_seen)
-        env->min_dist_norm_seen = cur_dist_norm;
-
-    // Terminal rewards: +1 reach, -1 fall, else shaping only (plus timeout).
-    // Flat per-step cost keeps stalling from being optimal.
-    float r = dist_delta * LABYRINTH_PROGRESS_REWARD_SCALE - LABYRINTH_STEP_PENALTY;
+    // Potential-based reward shaping (see LABYRINTH_SHAPING_GAMMA block above
+    // for the derivation). Force φ(terminal)=0 so the discounted cumulative
+    // shaping telescopes to a policy-invariant −φ(s_0).
     int terminal = 0;
-    if (env->phys.reached_goal) {
+    if (env->phys.reached_goal || env->phys.fell_in_hole || env->tick >= env->max_steps)
+        terminal = 1;
+    float cur_dist_norm = labyrinth_dist_to_goal_norm(env);
+    float phi_cur  = terminal ? 0.0f
+                              : LABYRINTH_POTENTIAL_SCALE * (1.0f - cur_dist_norm);
+    float phi_prev = LABYRINTH_POTENTIAL_SCALE * (1.0f - env->prev_dist_norm);
+    float shaping = LABYRINTH_SHAPING_GAMMA * phi_cur - phi_prev;
+    env->prev_dist_norm = cur_dist_norm;
+
+    float r = shaping - LABYRINTH_STEP_PENALTY;
+    if (env->phys.reached_goal)
         r += 1.0f;
-        terminal = 1;
-    } else if (env->phys.fell_in_hole) {
+    else if (env->phys.fell_in_hole)
         r += -1.0f;
-        terminal = 1;
-    } else if (env->tick >= env->max_steps) {
-        terminal = 1;
-    }
     env->rewards[0] = r;
     env->terminals[0] = (float)terminal;
     env->episode_return += r;

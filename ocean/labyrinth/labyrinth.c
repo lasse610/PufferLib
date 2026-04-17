@@ -7,6 +7,7 @@
  *   Shift:      fine-tilt
  *   R:          reset current maze
  *   N:          advance to next seed (new maze)
+ *   [ / ]:      decrease / increase curriculum difficulty (reloads maze)
  *   H:          toggle HUD
  *   ESC:        quit
  *
@@ -34,8 +35,9 @@ int main(void) {
 
     Labyrinth phys = {0};
     uint32_t seed = 67890;
+    float difficulty = 1.0f;
     labyrinth_reset(&phys);
-    labyrinth_load_random_maze(&phys, seed);
+    labyrinth_load_curriculum_maze(&phys, seed, difficulty);
 
     const float tilt_rate = 0.5f;
     bool show_hud = true;
@@ -55,12 +57,24 @@ int main(void) {
         if (IsKeyDown(KEY_DOWN))  phys.tilt_y += rate * dt;
         if (IsKeyPressed(KEY_R)) {
             labyrinth_reset(&phys);
-            labyrinth_load_random_maze(&phys, seed);
+            labyrinth_load_curriculum_maze(&phys, seed, difficulty);
         }
         if (IsKeyPressed(KEY_N)) {
             seed++;
             labyrinth_reset(&phys);
-            labyrinth_load_random_maze(&phys, seed);
+            labyrinth_load_curriculum_maze(&phys, seed, difficulty);
+        }
+        if (IsKeyPressed(KEY_LEFT_BRACKET)) {
+            difficulty -= 0.25f;
+            if (difficulty < 0.0f) difficulty = 0.0f;
+            labyrinth_reset(&phys);
+            labyrinth_load_curriculum_maze(&phys, seed, difficulty);
+        }
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+            difficulty += 0.25f;
+            if (difficulty > 1.0f) difficulty = 1.0f;
+            labyrinth_reset(&phys);
+            labyrinth_load_curriculum_maze(&phys, seed, difficulty);
         }
         if (IsKeyPressed(KEY_H))
             show_hud = !show_hud;
@@ -92,8 +106,10 @@ int main(void) {
         EndMode3D();
 
         if (show_hud) {
-            DrawText("Labyrinth 3D  —  arrows tilt, shift=fine, R=reset, N=new maze, H=hud", 10,
+            DrawText("Labyrinth 3D  —  arrows tilt, shift=fine, R=reset, N=new maze, [ ]=difficulty, H=hud", 10,
                      10, 14, (Color){0, 187, 187, 255});
+            DrawText(TextFormat("difficulty=%.2f  (seed=%u)", difficulty, seed),
+                     window_w - 280, 30, 14, (Color){255, 220, 90, 255});
             DrawText(TextFormat("tilt  x=%+.3f rad (%+.1fdeg)  y=%+.3f rad (%+.1fdeg)",
                                 phys.tilt_x, phys.tilt_x * 180.0f / PI_F,
                                 phys.tilt_y, phys.tilt_y * 180.0f / PI_F),
