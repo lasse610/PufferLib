@@ -416,7 +416,7 @@ static inline void draw_board(const Labyrinth* env) {
 // [vx, vy, vz, tilt_x, tilt_y, goal_dx, goal_dy, bfs_dist_norm]
 // bfs_dist_norm is the ball cell's BFS distance-to-goal through the maze,
 // normalized to [0, 1]. Encodes "how much maze is left", not "how far off the
-// designer's ideal polyline".
+// designer's ideal polyline" — the PATH cells in the local grid do that.
 #define LABYRINTH_SCALAR_FEATURES 8
 
 // Potential-based reward shaping (Ng, Harada & Russell 1999):
@@ -441,6 +441,12 @@ static inline void draw_board(const Labyrinth* env) {
 // Flat per-step cost. Tiebreaker against shaping plateaus where φ doesn't
 // change much between cells; also a small extra push to terminate quickly.
 #define LABYRINTH_STEP_PENALTY 0.002f
+
+// Small bonus for being on a PATH-tagged cell (the BFS-optimal corridor).
+// Nudges the policy toward "find the highway, then follow it" — it's small
+// enough that staying still on path still loses net reward (step penalty +
+// shaping's stall term > bonus), so it doesn't create a new stall attractor.
+#define LABYRINTH_ON_PATH_BONUS 0.005f
 
 // Total observation size — must stay in sync with binding.c's OBS_SIZE.
 #define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
@@ -606,9 +612,11 @@ static inline int point_on_path(const Labyrinth* p, float px, float py, float r)
 static inline void build_grid(LabyrinthEnv* env) {
     const Labyrinth* p = &env->phys;
     const float cell = LABYRINTH_VIEW_CELL_M;
-    // Path cells are marked within this radius of the polyline so thin lines
-    // still register in a coarse grid.
-    const float path_r = 0.75f * cell;
+    // Path cells are marked within this radius of the BFS-optimal polyline.
+    // Wider than one view-cell so the path reads as a CORRIDOR in the agent's
+    // 15×15 local view rather than a thin hairline it can easily drift off of.
+    // ~2.5× view-cell = 15mm = roughly half a maze-cell width.
+    const float path_r = 2.5f * cell;
     for (int gy = 0; gy < LABYRINTH_GRID_H; gy++) {
         for (int gx = 0; gx < LABYRINTH_GRID_W; gx++) {
             float cx = (gx + 0.5f) * cell;
@@ -689,9 +697,22 @@ static inline void build_distance_field(LabyrinthEnv* env) {
     env->max_dist = (max_d > 0) ? max_d : 1;
 }
 
+// BFS distance-to-goal at an arbitrary view-grid cell, normalized to [0, 1].
+// Off-grid or unreachable (wall/hole) cells return 1.0.
+static inline float labyrinth_dist_norm_at(const LabyrinthEnv* env, int gx, int gy) {
+    if (gx < 0 || gx >= LABYRINTH_GRID_W || gy < 0 || gy >= LABYRINTH_GRID_H)
+        return 1.0f;
+    unsigned short d = env->dist_to_goal[gy * LABYRINTH_GRID_W + gx];
+    if (d == 0xFFFFu)
+        return 1.0f;
+    float n = (float)d / (float)env->max_dist;
+    if (n > 1.0f) n = 1.0f;
+    return n;
+}
+
 // Look up the ball's current BFS-distance-to-goal, normalized to [0, 1].
-// 0 = at the goal, 1 = maximum-distance reachable cell. Unreachable or
-// out-of-bounds positions clamp to 1.
+// 0 = at the goal, 1 = maximum-distance reachable cell. Off-board positions
+// clamp to the nearest grid cell (so the BFS field is always defined).
 static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     int gx = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
     int gy = (int)(env->phys.ball_y / LABYRINTH_VIEW_CELL_M);
@@ -699,13 +720,7 @@ static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     if (gx >= LABYRINTH_GRID_W) gx = LABYRINTH_GRID_W - 1;
     if (gy < 0) gy = 0;
     if (gy >= LABYRINTH_GRID_H) gy = LABYRINTH_GRID_H - 1;
-    unsigned short d = env->dist_to_goal[gy * LABYRINTH_GRID_W + gx];
-    if (d == 0xFFFFu)
-        return 1.0f;
-    float n = (float)d / (float)env->max_dist;
-    if (n < 0.0f) n = 0.0f;
-    if (n > 1.0f) n = 1.0f;
-    return n;
+    return labyrinth_dist_norm_at(env, gx, gy);
 }
 
 // Build the observation buffer: a 15x15 local window centered on the ball,
@@ -808,6 +823,15 @@ static inline void c_step(LabyrinthEnv* env) {
     env->prev_dist_norm = cur_dist_norm;
 
     float r = shaping - LABYRINTH_STEP_PENALTY;
+    // On-path bonus: if the ball's current view-grid cell is tagged PATH,
+    // pay a small per-step reward.
+    int gx_cell = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
+    int gy_cell = (int)(env->phys.ball_y / LABYRINTH_VIEW_CELL_M);
+    if (gx_cell >= 0 && gx_cell < LABYRINTH_GRID_W &&
+        gy_cell >= 0 && gy_cell < LABYRINTH_GRID_H &&
+        env->grid[gy_cell * LABYRINTH_GRID_W + gx_cell] == LABYRINTH_CELL_PATH) {
+        r += LABYRINTH_ON_PATH_BONUS;
+    }
     if (env->phys.reached_goal)
         r += 1.0f;
     else if (env->phys.fell_in_hole)
