@@ -388,10 +388,13 @@ static inline void draw_board(const Labyrinth* env) {
 // ===== RL env API =====
 
 // ---- Action space ----
-// Discrete: 0=no-op, 1/2=tilt_x +/-, 3/4=tilt_y +/-.
-#define LABYRINTH_NUM_ACTIONS 5
-// How much tilt changes per single +/- action (radians).
-#define LABYRINTH_TILT_STEP 0.02f
+// Continuous, 2 dimensions: target tilt in [-1, 1], scaled to radians by
+// MAX_TILT_RAD when applied. The agent commands the desired tilt directly
+// rather than incrementing it — fine motor control without having to "spell
+// out" a sequence of discrete tilt-step actions to reach the angle it wants.
+//   actions[0] = target tilt_x  (positive → ball accelerates +x)
+//   actions[1] = target tilt_y  (positive → ball accelerates +y)
+#define LABYRINTH_NUM_ACTION_DIMS 2
 
 // ---- Observation space: local vision + scalars ----
 // Board is rasterized into a coarse grid at reset(); each step the env copies
@@ -531,7 +534,7 @@ typedef struct LabyrinthEnv {
 // Python/vecenv path wires buffer pointers into a pre-allocated tensor.
 static inline LabyrinthEnv* allocate_LabyrinthEnv(LabyrinthEnv* env) {
     env->observations = (float*)calloc(LABYRINTH_OBS_SIZE, sizeof(float));
-    env->actions = (float*)calloc(1, sizeof(float));
+    env->actions = (float*)calloc(LABYRINTH_NUM_ACTION_DIMS, sizeof(float));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (float*)calloc(1, sizeof(float));
     return env;
@@ -784,21 +787,17 @@ static inline void c_reset(LabyrinthEnv* env) {
 
 // Apply action, advance physics, compute reward/terminal/obs.
 static inline void c_step(LabyrinthEnv* env) {
-    // Read discrete action → tilt delta. Actions arrive as floats even when
-    // the space is discrete — cast to an integer.
-    int a = (int)env->actions[0];
-    float dt_tilt = LABYRINTH_TILT_STEP;
-    switch (a) {
-        case 1: env->phys.tilt_x += dt_tilt; break;
-        case 2: env->phys.tilt_x -= dt_tilt; break;
-        case 3: env->phys.tilt_y += dt_tilt; break;
-        case 4: env->phys.tilt_y -= dt_tilt; break;
-        default: break; // 0 = no-op
-    }
-    if (env->phys.tilt_x > MAX_TILT_RAD)  env->phys.tilt_x = MAX_TILT_RAD;
-    if (env->phys.tilt_x < -MAX_TILT_RAD) env->phys.tilt_x = -MAX_TILT_RAD;
-    if (env->phys.tilt_y > MAX_TILT_RAD)  env->phys.tilt_y = MAX_TILT_RAD;
-    if (env->phys.tilt_y < -MAX_TILT_RAD) env->phys.tilt_y = -MAX_TILT_RAD;
+    // Continuous action: clamp to [-1, 1], scale to physical tilt range.
+    // Setting tilt directly each step (rather than integrating an increment)
+    // gives the agent fine-grained motor control of the board.
+    float ax = env->actions[0];
+    float ay = env->actions[1];
+    if (ax < -1.0f) ax = -1.0f;
+    if (ax >  1.0f) ax =  1.0f;
+    if (ay < -1.0f) ay = -1.0f;
+    if (ay >  1.0f) ay =  1.0f;
+    env->phys.tilt_x = ax * MAX_TILT_RAD;
+    env->phys.tilt_y = ay * MAX_TILT_RAD;
 
     // Run multiple physics substeps per agent decision. Early-exit on
     // terminal so we don't keep simulating after the episode ends.

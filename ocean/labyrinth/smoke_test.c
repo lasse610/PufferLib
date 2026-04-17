@@ -64,7 +64,9 @@ int main(void) {
 
     for (int t = 0; t < N_STEPS; t++) {
         rng = rng * 1664525u + 1013904223u;
-        env.actions[0] = (float)(rng % (unsigned)LABYRINTH_NUM_ACTIONS);
+        // Continuous: 2 random tilts in [-1, 1].
+        env.actions[0] = ((float)(rng & 0xFFFF) / 32768.0f) - 1.0f;
+        env.actions[1] = ((float)((rng >> 16) & 0xFFFF) / 32768.0f) - 1.0f;
 
         c_step(&env);
 

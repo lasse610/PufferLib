@@ -1,8 +1,8 @@
 #include "labyrinth.h"
 
 #define OBS_SIZE LABYRINTH_OBS_SIZE
-#define NUM_ATNS 1
-#define ACT_SIZES {LABYRINTH_NUM_ACTIONS}
+#define NUM_ATNS LABYRINTH_NUM_ACTION_DIMS
+#define ACT_SIZES {1, 1}  // 2 continuous dims (size 1 = continuous in PufferLib)
 #define OBS_TENSOR_T FloatTensor
 
 #define Env LabyrinthEnv
