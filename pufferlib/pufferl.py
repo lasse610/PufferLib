@@ -217,6 +217,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
+    load_path = args.get('load_model_path')
+    if load_path is not None and load_path != 'None':
+        backend.load_weights(pufferl, load_path)
+        print(f'Loaded weights from {load_path}')
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
@@ -422,7 +427,8 @@ def eval(env_name, args=None, load_path=None):
         print(f'Loaded weights from {load_path}')
 
     while True:
-        backend.render(pufferl, 0)
+        if args.get('render_mode') != 'none':
+            backend.render(pufferl, 0)
         backend.rollouts(pufferl)
 
     backend.close(pufferl)

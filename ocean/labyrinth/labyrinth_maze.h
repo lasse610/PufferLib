@@ -318,14 +318,14 @@ static inline void labyrinth_load_random_maze(Labyrinth* env, uint32_t seed) {
     labyrinth_generate_grid_maze(env, seed, 6, 7, 0.5f, 0);
 }
 
-// Curriculum maze: fixed 6×7 layout, only barrier_prob ramps with difficulty.
-// Difficulty is capped at 0.6 (≈30% hole-barriers); higher densities were
-// empirically untrainable with our PPO+small-policy setup.
+// Curriculum maze: smaller 4×5 layout, only barrier_prob ramps with difficulty.
+// 4×5 = 20 cells, max ~6 hole-barriers at d=1.0 — within reach for our PPO
+// setup. The 6×7 with up to 25 hole-barriers proved untrainable.
 static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed, float difficulty) {
     if (difficulty < 0.0f) difficulty = 0.0f;
-    if (difficulty > 0.6f) difficulty = 0.6f;
+    if (difficulty > 1.0f) difficulty = 1.0f;
     float barrier_prob = difficulty * 0.5f;
-    labyrinth_generate_grid_maze(env, seed, 6, 7, barrier_prob, 0);
+    labyrinth_generate_grid_maze(env, seed, 4, 5, barrier_prob, 0);
 }
 
 #endif
