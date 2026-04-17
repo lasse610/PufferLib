@@ -412,9 +412,11 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_SHAPING_GAMMA 0.995f
 #define LABYRINTH_POTENTIAL_SCALE 3.0f
 
-// Flat per-step cost; max_steps × this must exceed the fall penalty so
-// stall-to-timeout is worse than falling.
-#define LABYRINTH_STEP_PENALTY 0.002f
+// Flat per-step cost. Sized so stall-to-timeout has strictly worse
+// discounted return than falling quickly: with γ=0.995 and a -1 fall
+// terminal, stalling 2000 steps at 0.01/step yields discounted return
+// ≈ -2 vs a 100-step fall ≈ -1.4 — stalling is never the optimal option.
+#define LABYRINTH_STEP_PENALTY 0.01f
 
 #define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
 
