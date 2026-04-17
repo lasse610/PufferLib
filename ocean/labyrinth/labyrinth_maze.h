@@ -309,15 +309,61 @@ static inline void labyrinth_load_random_maze(Labyrinth* env, uint32_t seed) {
     labyrinth_generate_grid_maze(env, seed, 6, 7, 0.5f, 0);
 }
 
-// Curriculum maze: difficulty in [0, 1] interpolates rows, cols, and
-// barrier_prob between 3×4 walls-only (no holes) and 6×7 with half hole-barriers.
+// Balance-only easy: no interior walls or holes; just place the ball and goal
+// with a distance that scales with sub_difficulty. Forces the agent to
+// practice tilt control and parking instead of wall-bouncing.
+static inline void labyrinth_load_balance_easy(Labyrinth* env, uint32_t seed, float sub_difficulty) {
+    if (sub_difficulty < 0.0f) sub_difficulty = 0.0f;
+    if (sub_difficulty > 1.0f) sub_difficulty = 1.0f;
+    uint32_t rng = seed | 1u;
+
+    // Ball at a random in-board position (with margin for the border wall).
+    float margin = 0.02f;
+    float rb1 = (float)(lab_rng_next(&rng) & 0xFFFF) / 65535.0f;
+    float rb2 = (float)(lab_rng_next(&rng) & 0xFFFF) / 65535.0f;
+    float bx = margin + rb1 * (BOARD_W - 2.0f * margin);
+    float by = margin + rb2 * (BOARD_H - 2.0f * margin);
+
+    // Goal at a bearing from ball with distance scaled by sub_difficulty:
+    // at 0 the goal sits a few cm away (short roll), at 1 it's roughly the
+    // board diagonal (long roll, lots of chance to overshoot).
+    float min_d = 0.05f;
+    float max_d = 0.9f * sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
+    float target_d = min_d + sub_difficulty * (max_d - min_d);
+    float a = (float)(lab_rng_next(&rng) & 0xFFFF) / 65535.0f * 2.0f * 3.14159265f;
+    float gx = bx + target_d * cosf(a);
+    float gy = by + target_d * sinf(a);
+    if (gx < margin) gx = margin;
+    if (gx > BOARD_W - margin) gx = BOARD_W - margin;
+    if (gy < margin) gy = margin;
+    if (gy > BOARD_H - margin) gy = BOARD_H - margin;
+
+    labyrinth_place_ball(env, bx, by);
+    labyrinth_set_goal(env, gx, gy, 0.018f);
+
+    // Straight-line path hint for the obs grid's PATH cells.
+    env->num_path_points = 2;
+    env->path_points[0][0] = bx;
+    env->path_points[0][1] = by;
+    env->path_points[1][0] = gx;
+    env->path_points[1][1] = gy;
+}
+
+// Curriculum loader branched on difficulty band:
+//   d ∈ [0.0, 0.6)  — open-arena balance practice, increasing roll distance
+//   d ∈ [0.6, 1.0]  — procedural maze, increasing hole-barrier density
 static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed, float difficulty) {
     if (difficulty < 0.0f) difficulty = 0.0f;
     if (difficulty > 1.0f) difficulty = 1.0f;
-    int rows = 3 + (int)(difficulty * 3.0f + 0.5f);
-    int cols = 4 + (int)(difficulty * 3.0f + 0.5f);
-    float barrier_prob = difficulty * 0.5f;
-    labyrinth_generate_grid_maze(env, seed, rows, cols, barrier_prob, 0);
+    if (difficulty < 0.6f) {
+        // Remap [0.0, 0.6) to sub_difficulty [0.0, 1.0].
+        labyrinth_load_balance_easy(env, seed, difficulty / 0.6f);
+    } else {
+        // Remap [0.6, 1.0] to maze_d [0.0, 1.0].
+        float maze_d = (difficulty - 0.6f) / 0.4f;
+        float barrier_prob = maze_d * 0.5f;
+        labyrinth_generate_grid_maze(env, seed, 6, 7, barrier_prob, 0);
+    }
 }
 
 #endif

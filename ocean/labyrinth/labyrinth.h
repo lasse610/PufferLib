@@ -400,9 +400,13 @@ static inline void draw_board(const Labyrinth* env) {
 // [vx, vy, vz, tilt_x, tilt_y, goal_dx, goal_dy, bfs_dist_norm].
 #define LABYRINTH_SCALAR_FEATURES 8
 
-// Watermark shaping: pay (best_seen_norm − current_norm) × SCALE only when
-// the step sets a new best distance-to-goal. Backtracking earns 0.
-#define LABYRINTH_PROGRESS_REWARD_SCALE 0.5f
+// Potential-based shaping (Ng 1999): F = γ·φ(s') − φ(s),
+// with φ(s) = k · (1 − bfs_dist_norm) and φ(terminal) ≡ 0. Discounted
+// cumulative shaping telescopes to −φ(s_0), so the optimal policy is
+// invariant; per-step F gives the agent a dense gradient signal.
+// γ_shaping must match the training discount.
+#define LABYRINTH_SHAPING_GAMMA 0.995f
+#define LABYRINTH_POTENTIAL_SCALE 3.0f
 
 // Flat per-step cost; max_steps × this must exceed the fall penalty so
 // stall-to-timeout is worse than falling.
@@ -415,11 +419,14 @@ static inline void draw_board(const Labyrinth* env) {
 // Physics substeps per agent decision. 4 substeps × 200Hz physics = 50Hz agent.
 #define LABYRINTH_PHYSICS_SUBSTEPS 4
 
-// Curriculum defaults: difficulty_start in [0,1], curriculum_episodes=0 keeps
-// it static, >0 ramps each env from difficulty_start to 1.0 over that many
-// of its own episodes.
+// Adaptive curriculum: each env advances its own difficulty by CURR_STEP
+// whenever >= CURR_THRESHOLD fraction of the last `curriculum_window` episodes
+// reached the goal. curriculum_window=0 disables the curriculum (static).
 #define LABYRINTH_DIFFICULTY_START 1.0f
-#define LABYRINTH_CURRICULUM_EPISODES 0
+#define LABYRINTH_CURRICULUM_WINDOW 0
+#define LABYRINTH_CURRICULUM_MAX_WINDOW 64
+#define LABYRINTH_CURRICULUM_THRESHOLD 0.5f
+#define LABYRINTH_CURRICULUM_STEP 0.1f
 
 typedef struct Log {
     float perf;           // normalized score in [0, 1]: 1.0 if reached goal
@@ -461,11 +468,14 @@ typedef struct LabyrinthEnv {
     unsigned char grid[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
     unsigned short dist_to_goal[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
     int max_dist;
-    float min_dist_norm_seen;
+    float prev_dist_norm;
 
-    int episode_count;
     float difficulty_start;
-    int curriculum_episodes;
+    int curriculum_window;
+    float current_difficulty;
+    int recent_solves[LABYRINTH_CURRICULUM_MAX_WINDOW];
+    int recent_idx;
+    int recent_count;
 } LabyrinthEnv;
 
 static inline LabyrinthEnv* allocate_LabyrinthEnv(LabyrinthEnv* env) {
@@ -495,11 +505,15 @@ static inline void init(LabyrinthEnv* env) {
     env->maze_seed = env->seed;
     env->episode_return = 0.0f;
     env->client = NULL;
-    env->episode_count = 0;
     if (env->difficulty_start < 0.0f || env->difficulty_start > 1.0f)
         env->difficulty_start = LABYRINTH_DIFFICULTY_START;
-    if (env->curriculum_episodes < 0)
-        env->curriculum_episodes = LABYRINTH_CURRICULUM_EPISODES;
+    if (env->curriculum_window < 0)
+        env->curriculum_window = LABYRINTH_CURRICULUM_WINDOW;
+    if (env->curriculum_window > LABYRINTH_CURRICULUM_MAX_WINDOW)
+        env->curriculum_window = LABYRINTH_CURRICULUM_MAX_WINDOW;
+    env->current_difficulty = env->difficulty_start;
+    env->recent_idx = 0;
+    env->recent_count = 0;
 }
 
 static inline void add_log(LabyrinthEnv* env) {
@@ -675,25 +689,41 @@ static inline void compute_observations(LabyrinthEnv* env) {
     o[LABYRINTH_VIEW_SIZE + 7] = labyrinth_dist_to_goal_norm(env);
 }
 
+// Adaptive curriculum: record this episode's outcome in the sliding window;
+// bump difficulty when >= threshold of the window are solved.
+static inline void labyrinth_curriculum_record(LabyrinthEnv* env, int solved) {
+    if (env->curriculum_window <= 0 || env->current_difficulty >= 1.0f)
+        return;
+    env->recent_solves[env->recent_idx] = solved;
+    env->recent_idx = (env->recent_idx + 1) % env->curriculum_window;
+    if (env->recent_count < env->curriculum_window)
+        env->recent_count++;
+    if (env->recent_count < env->curriculum_window)
+        return;
+    int s = 0;
+    for (int i = 0; i < env->curriculum_window; i++)
+        s += env->recent_solves[i];
+    if (s * 1.0f / env->curriculum_window >= LABYRINTH_CURRICULUM_THRESHOLD) {
+        env->current_difficulty += LABYRINTH_CURRICULUM_STEP;
+        if (env->current_difficulty > 1.0f)
+            env->current_difficulty = 1.0f;
+        env->recent_count = 0;
+        env->recent_idx = 0;
+    }
+}
+
 static inline void c_reset(LabyrinthEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->maze_seed += 1u;
-    float difficulty = env->difficulty_start;
-    if (env->curriculum_episodes > 0) {
-        float progress = (float)env->episode_count / (float)env->curriculum_episodes;
-        if (progress > 1.0f) progress = 1.0f;
-        difficulty = env->difficulty_start + (1.0f - env->difficulty_start) * progress;
-    }
     labyrinth_reset(&env->phys);
-    labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, difficulty);
+    labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, env->current_difficulty);
     build_grid(env);
     build_distance_field(env);
-    env->min_dist_norm_seen = labyrinth_dist_to_goal_norm(env);
+    env->prev_dist_norm = labyrinth_dist_to_goal_norm(env);
     compute_observations(env);
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0.0f;
-    env->episode_count += 1;
 }
 
 static inline void c_step(LabyrinthEnv* env) {
@@ -713,29 +743,27 @@ static inline void c_step(LabyrinthEnv* env) {
     }
     env->tick += 1;
 
-    float cur_dist_norm = labyrinth_dist_to_goal_norm(env);
-    float dist_delta = env->min_dist_norm_seen - cur_dist_norm;
-    if (dist_delta < 0.0f)
-        dist_delta = 0.0f;
-    if (cur_dist_norm < env->min_dist_norm_seen)
-        env->min_dist_norm_seen = cur_dist_norm;
-
-    float r = dist_delta * LABYRINTH_PROGRESS_REWARD_SCALE - LABYRINTH_STEP_PENALTY;
     int terminal = 0;
-    if (env->phys.reached_goal) {
+    if (env->phys.reached_goal || env->phys.fell_in_hole || env->tick >= env->max_steps)
+        terminal = 1;
+    float cur_dist_norm = labyrinth_dist_to_goal_norm(env);
+    float phi_cur  = terminal ? 0.0f
+                              : LABYRINTH_POTENTIAL_SCALE * (1.0f - cur_dist_norm);
+    float phi_prev = LABYRINTH_POTENTIAL_SCALE * (1.0f - env->prev_dist_norm);
+    float shaping = LABYRINTH_SHAPING_GAMMA * phi_cur - phi_prev;
+    env->prev_dist_norm = cur_dist_norm;
+
+    float r = shaping - LABYRINTH_STEP_PENALTY;
+    if (env->phys.reached_goal)
         r += 1.0f;
-        terminal = 1;
-    } else if (env->phys.fell_in_hole) {
+    else if (env->phys.fell_in_hole)
         r += -1.0f;
-        terminal = 1;
-    } else if (env->tick >= env->max_steps) {
-        terminal = 1;
-    }
     env->rewards[0] = r;
     env->terminals[0] = (float)terminal;
     env->episode_return += r;
 
     if (terminal) {
+        labyrinth_curriculum_record(env, env->phys.reached_goal ? 1 : 0);
         add_log(env);
         c_reset(env);
     } else {

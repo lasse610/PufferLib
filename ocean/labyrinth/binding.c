@@ -14,7 +14,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->max_steps = (int)dict_get(kwargs, "max_steps")->value;
     env->physics_substeps = (int)dict_get(kwargs, "physics_substeps")->value;
     env->difficulty_start = (float)dict_get(kwargs, "difficulty_start")->value;
-    env->curriculum_episodes = (int)dict_get(kwargs, "curriculum_episodes")->value;
+    env->curriculum_window = (int)dict_get(kwargs, "curriculum_window")->value;
     init(env);
 }
 

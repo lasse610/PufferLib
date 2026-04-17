@@ -32,6 +32,11 @@
 #define MAX_TILT_RAD 0.20f
 #define PHYSICS_DT (1.0f / 200.0f)
 
+// Max speed at which the ball can count as "reached goal". Typical rolling
+// speeds are 0.5–1.5 m/s at max tilt; this forces the agent to decelerate
+// and park on the goal pad rather than ramming through it.
+#define GOAL_MAX_VEL 0.3f
+
 #define MAX_WALLS 96
 #define WALL_THICKNESS_M 0.004f
 #define WALL_HALF_THICKNESS (0.5f * WALL_THICKNESS_M)
@@ -541,12 +546,15 @@ static inline void labyrinth_step(Labyrinth* env) {
     env->fell_in_hole =
         (env->ball_z < 0.0f) && xy_in_any_hole(env, env->ball_x, env->ball_y);
     env->reached_goal = 0;
-    // Goal counts only while the ball is at or above the slab top plane —
-    // a fallen ball at the bottom of a pit at the goal xy doesn't count.
+    // Goal counts only while the ball is on the slab AND slow enough that
+    // it's parked, not hurtling through. GOAL_MAX_VEL keeps a ball ramming
+    // across the goal from scoring.
     if (env->goal_radius > 0.0f && env->ball_z >= 0.0f) {
         float dx = env->ball_x - env->goal_cx;
         float dy = env->ball_y - env->goal_cy;
-        if (dx * dx + dy * dy < env->goal_radius * env->goal_radius)
+        float v2 = env->ball_vx * env->ball_vx + env->ball_vy * env->ball_vy;
+        if (dx * dx + dy * dy < env->goal_radius * env->goal_radius &&
+            v2 < GOAL_MAX_VEL * GOAL_MAX_VEL)
             env->reached_goal = 1;
     }
 
