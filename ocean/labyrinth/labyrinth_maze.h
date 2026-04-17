@@ -309,23 +309,8 @@ static inline void labyrinth_load_random_maze(Labyrinth* env, uint32_t seed) {
     labyrinth_generate_grid_maze(env, seed, 6, 7, 0.5f, 0);
 }
 
-// Curriculum maze: interpolates between "trivially easy" (3x4 grid, no holes,
-// only walls) and the default hard random maze (6x7, half hole-barriers).
-//
-//   difficulty | rows × cols | barrier_prob |  effect
-//   -----------+-------------+--------------+------------------
-//       0.0    |    3 × 4    |     0.0      |  small maze, ALL walls — ball cannot fall
-//       0.33   |    4 × 5    |     0.17     |  a few hole barriers
-//       0.67   |    5 × 6    |     0.33     |  medium density
-//       1.0    |    6 × 7    |     0.5      |  default (current hard behavior)
-//
-// At difficulty=0 the agent can't fall — positive goal-reaching trajectories are
-// frequent enough that sparse-reward training gets a signal. Ramp upward once
-// the policy has learned to navigate.
-//
-// Keep holes OFF the spanning-tree path until the agent can already solve the
-// wall-only version; obstacle-hole sprinkling stays at 0 for now (reserved
-// for future higher-end difficulty).
+// Curriculum maze: difficulty in [0, 1] interpolates rows, cols, and
+// barrier_prob between 3×4 walls-only (no holes) and 6×7 with half hole-barriers.
 static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed, float difficulty) {
     if (difficulty < 0.0f) difficulty = 0.0f;
     if (difficulty > 1.0f) difficulty = 1.0f;

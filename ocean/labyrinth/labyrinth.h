@@ -1,17 +1,5 @@
-/* Labyrinth — tilt-a-ball marble maze Ocean env.
- *
- * This header wires the pure physics (labyrinth_physics.h) and the maze
- * generator (labyrinth_maze.h) into the Ocean RL env API:
- *   LabyrinthEnv   — the struct with observations/actions/rewards/log
- *   c_reset        — start an episode (fresh maze + ball at start)
- *   c_step         — apply one action, advance physics, write reward/obs
- *   c_render       — raylib 3D view (board + tilt + pits + ball + path)
- *   c_close        — close the window
- *
- * binding.c is thin — just macros + my_init/my_log.
- * labyrinth.c (standalone) uses this same header for the game loop.
- * test_labyrinth.c pulls in labyrinth_physics.h directly (no raylib link).
- */
+/* Labyrinth Ocean RL env: wires labyrinth_physics + labyrinth_maze into the
+ * c_reset / c_step / c_render / c_close API used by binding.c. */
 
 #ifndef LABYRINTH_H
 #define LABYRINTH_H
@@ -387,13 +375,8 @@ static inline void draw_board(const Labyrinth* env) {
 
 // ===== RL env API =====
 
-// ---- Action space ----
-// Continuous, 2 dimensions: target tilt in [-1, 1], scaled to radians by
-// MAX_TILT_RAD when applied. The agent commands the desired tilt directly
-// rather than incrementing it — fine motor control without having to "spell
-// out" a sequence of discrete tilt-step actions to reach the angle it wants.
-//   actions[0] = target tilt_x  (positive → ball accelerates +x)
-//   actions[1] = target tilt_y  (positive → ball accelerates +y)
+// Action: 2 continuous dims in [-1, 1], scaled to MAX_TILT_RAD. Agent sets
+// target tilt_x, tilt_y directly each step.
 #define LABYRINTH_NUM_ACTION_DIMS 2
 
 // ---- Observation space: local vision + scalars ----
@@ -406,67 +389,35 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_VIEW_DIM (2 * LABYRINTH_VISION + 1)                   // 15
 #define LABYRINTH_VIEW_SIZE (LABYRINTH_VIEW_DIM * LABYRINTH_VIEW_DIM)   // 225
 
-// Cell codes. Priority (high→low) when multiple features land on the same
-// cell: HOLE > WALL > GOAL > PATH > EMPTY. HOLE is most important for
-// survival, PATH is just a hint.
+// Cell codes. Priority on overlap: HOLE > WALL > GOAL > PATH > EMPTY.
 #define LABYRINTH_CELL_EMPTY 0
 #define LABYRINTH_CELL_WALL  1
 #define LABYRINTH_CELL_HOLE  2
 #define LABYRINTH_CELL_GOAL  3
 #define LABYRINTH_CELL_PATH  4
 
-// 8 scalar features appended after the grid:
-// [vx, vy, vz, tilt_x, tilt_y, goal_dx, goal_dy, bfs_dist_norm]
-// bfs_dist_norm is the ball cell's BFS distance-to-goal through the maze,
-// normalized to [0, 1]. Encodes "how much maze is left", not "how far off the
-// designer's ideal polyline" — the PATH cells in the local grid do that.
+// Scalars appended after the grid:
+// [vx, vy, vz, tilt_x, tilt_y, goal_dx, goal_dy, bfs_dist_norm].
 #define LABYRINTH_SCALAR_FEATURES 8
 
-// Potential-based reward shaping (Ng, Harada & Russell 1999):
-//   F(s, s') = γ_shaping · φ(s') − φ(s),   φ(terminal) ≡ 0
-// with potential
-//   φ(s) = LABYRINTH_POTENTIAL_SCALE · (1 − bfs_dist_norm(s))
-// so φ = k at the goal cell, 0 at the worst-reachable cell, ≥ 0 everywhere.
-//
-// Why this shape:
-//  - Sitting still pays F = (γ−1)·φ(s) ≤ 0 every step (worse the closer to
-//    goal the agent is) — kills the "go to a corner and time out" exploit.
-//  - Backtracking A→B→A nets negative: the discount makes the return trip
-//    cost more than the forward trip pays — kills oscillation farming.
-//  - Discounted cumulative shaping over an episode telescopes to −φ(s_0)
-//    (policy-invariant offset) once we force φ(terminal)=0; the sparse
-//    ±1 on goal/fall is still what the optimizer actually trades for.
-//
-// γ_shaping must match the training discount; bump together if either changes.
-#define LABYRINTH_SHAPING_GAMMA 0.995f
-#define LABYRINTH_POTENTIAL_SCALE 3.0f
+// Watermark shaping: pay (best_seen_norm − current_norm) × SCALE only when
+// the step sets a new best distance-to-goal. Backtracking earns 0.
+#define LABYRINTH_PROGRESS_REWARD_SCALE 0.5f
 
-// Flat per-step cost. Tiebreaker against shaping plateaus where φ doesn't
-// change much between cells; also a small extra push to terminate quickly.
+// Flat per-step cost; max_steps × this must exceed the fall penalty so
+// stall-to-timeout is worse than falling.
 #define LABYRINTH_STEP_PENALTY 0.002f
 
-// Small bonus for being on a PATH-tagged cell (the BFS-optimal corridor).
-// Nudges the policy toward "find the highway, then follow it" — it's small
-// enough that staying still on path still loses net reward (step penalty +
-// shaping's stall term > bonus), so it doesn't create a new stall attractor.
-#define LABYRINTH_ON_PATH_BONUS 0.005f
-
-// Total observation size — must stay in sync with binding.c's OBS_SIZE.
 #define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
 
-// Default episode length cap (c_steps, not physics steps).
 #define LABYRINTH_MAX_STEPS 2000
 
-// Default physics substeps per agent decision. Each c_step advances the
-// physics by `physics_substeps` × PHYSICS_DT seconds. 4 gives a ~50 Hz agent
-// rate on top of the 200 Hz physics — human-ish reaction cadence and 4× more
-// simulated time per step, so a 2000-step episode = 40 s of real time.
+// Physics substeps per agent decision. 4 substeps × 200Hz physics = 50Hz agent.
 #define LABYRINTH_PHYSICS_SUBSTEPS 4
 
-// Curriculum defaults. `difficulty_start` is the floor (0=trivial, 1=full maze).
-// `curriculum_episodes` = 0 means no ramping — stay at `difficulty_start` the
-// whole run. >0 means each env ramps from `difficulty_start` up to 1.0 over its
-// own first N episodes, then stays at 1.0. Default keeps current behavior.
+// Curriculum defaults: difficulty_start in [0,1], curriculum_episodes=0 keeps
+// it static, >0 ramps each env from difficulty_start to 1.0 over that many
+// of its own episodes.
 #define LABYRINTH_DIFFICULTY_START 1.0f
 #define LABYRINTH_CURRICULUM_EPISODES 0
 
@@ -487,51 +438,36 @@ typedef struct Client {
 } Client;
 
 typedef struct LabyrinthEnv {
-    // Required by vecenv.h binding framework. Buffer pointers are written by
-    // the framework (point into a pre-allocated agent-slot of a larger tensor)
-    // when the env is constructed from Python; allocate_LabyrinthEnv is only
-    // used for the standalone binary.
+    // Buffer pointers are wired by vecenv.h on construction; allocate_LabyrinthEnv
+    // is only used by the standalone binary.
     Log log;
     float* observations;
-    float* actions;       // discrete actions arrive as floats (cast to int)
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
-    unsigned int rng;     // framework-initialized RNG seed
+    unsigned int rng;
 
-    // Env-local state:
     Client* client;
-    Labyrinth phys;       // underlying physics state (walls/holes/ball)
+    Labyrinth phys;
     int tick;
     int max_steps;
-    int physics_substeps; // physics steps per c_step; bigger = slower action rate
-    uint32_t seed;        // seed supplied by kwargs
-    uint32_t maze_seed;   // current episode's maze seed (rotates each reset)
+    int physics_substeps;
+    uint32_t seed;
+    uint32_t maze_seed;
     float episode_return;
 
-    // Rasterized static board layout — rebuilt once per episode at reset(),
-    // then just indexed each step when building the observation window.
+    // Rasterized board + per-cell BFS-to-goal, rebuilt each reset().
     unsigned char grid[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
-
-    // BFS distance-to-goal through the maze, per grid cell. Walls and holes
-    // are impassable in the BFS, so distance respects obstacles. Rebuilt at
-    // reset(). Max distance across the map is cached for normalization.
     unsigned short dist_to_goal[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
-    int max_dist;                // largest reachable BFS distance (for normalization)
-    float prev_dist_norm;        // last step's bfs_dist_norm — used to compute
-                                 // F = γ·φ(s') − φ(s) on the next step.
+    int max_dist;
+    float min_dist_norm_seen;
 
-    // Curriculum state. `episode_count` is this env's completed-episode counter.
-    // At each c_reset the difficulty passed to the maze generator is:
-    //   d = difficulty_start + (1 − difficulty_start) · min(1, ep / curr_eps)
-    // (or just difficulty_start if curriculum_episodes == 0).
     int episode_count;
     float difficulty_start;
     int curriculum_episodes;
 } LabyrinthEnv;
 
-// Allocate per-agent buffers. Only needed for the standalone binary — the
-// Python/vecenv path wires buffer pointers into a pre-allocated tensor.
 static inline LabyrinthEnv* allocate_LabyrinthEnv(LabyrinthEnv* env) {
     env->observations = (float*)calloc(LABYRINTH_OBS_SIZE, sizeof(float));
     env->actions = (float*)calloc(LABYRINTH_NUM_ACTION_DIMS, sizeof(float));
@@ -547,7 +483,6 @@ static inline void free_allocated(LabyrinthEnv* env) {
     free(env->terminals);
 }
 
-// One-time setup — called after kwargs unpacked.
 static inline void init(LabyrinthEnv* env) {
     memset(&env->log, 0, sizeof(Log));
     env->tick = 0;
@@ -567,7 +502,6 @@ static inline void init(LabyrinthEnv* env) {
         env->curriculum_episodes = LABYRINTH_CURRICULUM_EPISODES;
 }
 
-// Log-aggregation helper called on terminal transitions.
 static inline void add_log(LabyrinthEnv* env) {
     int won = env->phys.reached_goal;
     int lost = env->phys.fell_in_hole;
@@ -580,12 +514,6 @@ static inline void add_log(LabyrinthEnv* env) {
     env->log.n += 1.0f;
 }
 
-// ---- Local-vision grid rasterization ----
-// Sample the static maze features (walls, holes, goal, path) into a board-
-// sized grid once per episode at reset(). Each observation step then just
-// copies a vision-sized window out of this grid.
-
-// Test whether a point (px, py) lies inside any wall's collision capsule.
 static inline int point_in_any_wall(const Labyrinth* p, float px, float py) {
     for (int i = 0; i < p->num_walls; i++) {
         const Wall* w = &p->walls[i];
@@ -598,7 +526,6 @@ static inline int point_in_any_wall(const Labyrinth* p, float px, float py) {
     return 0;
 }
 
-// Test whether a point lies within thickness `r` of any path polyline segment.
 static inline int point_on_path(const Labyrinth* p, float px, float py, float r) {
     for (int i = 0; i + 1 < p->num_path_points; i++) {
         float qx, qy;
@@ -615,10 +542,8 @@ static inline int point_on_path(const Labyrinth* p, float px, float py, float r)
 static inline void build_grid(LabyrinthEnv* env) {
     const Labyrinth* p = &env->phys;
     const float cell = LABYRINTH_VIEW_CELL_M;
-    // Path cells are marked within this radius of the BFS-optimal polyline.
-    // Wider than one view-cell so the path reads as a CORRIDOR in the agent's
-    // 15×15 local view rather than a thin hairline it can easily drift off of.
-    // ~2.5× view-cell = 15mm = roughly half a maze-cell width.
+    // Path cells fill ~half a maze-cell wide so the path reads as a corridor,
+    // not a hairline, in the local view.
     const float path_r = 2.5f * cell;
     for (int gy = 0; gy < LABYRINTH_GRID_H; gy++) {
         for (int gx = 0; gx < LABYRINTH_GRID_W; gx++) {
@@ -642,18 +567,15 @@ static inline void build_grid(LabyrinthEnv* env) {
     }
 }
 
-// BFS distance-to-goal per grid cell. Walls AND holes are impassable, so
-// the distance field is a true "how far is goal through the maze" — any
-// route the ball can actually travel respects it. Rebuilt at reset().
+// BFS distance-to-goal per grid cell. Walls and holes are impassable.
 static inline void build_distance_field(LabyrinthEnv* env) {
     const int N = LABYRINTH_GRID_W * LABYRINTH_GRID_H;
     const unsigned short INF = 0xFFFFu;
     for (int i = 0; i < N; i++)
         env->dist_to_goal[i] = INF;
 
-    // Seed: any cell tagged GOAL in the rasterized grid. Fallback: the
-    // goal-disk center mapped to its cell (in case the goal is too small to
-    // cover any grid cell's center).
+    // Seed from GOAL-tagged cells, with a fallback to the goal-disk center
+    // cell when the goal is too small to cover any grid cell's center.
     int queue[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
     int qh = 0, qt = 0;
     for (int i = 0; i < N; i++) {
@@ -687,8 +609,6 @@ static inline void build_distance_field(LabyrinthEnv* env) {
                 continue;
             int n = neigh[k];
             unsigned char c = env->grid[n];
-            // Walls and holes block BFS — the ball can't actually traverse
-            // through them alive, so distance through them isn't meaningful.
             if (c == LABYRINTH_CELL_WALL || c == LABYRINTH_CELL_HOLE)
                 continue;
             if (env->dist_to_goal[n] != INF)
@@ -700,8 +620,7 @@ static inline void build_distance_field(LabyrinthEnv* env) {
     env->max_dist = (max_d > 0) ? max_d : 1;
 }
 
-// BFS distance-to-goal at an arbitrary view-grid cell, normalized to [0, 1].
-// Off-grid or unreachable (wall/hole) cells return 1.0.
+// Normalized BFS distance at an arbitrary cell. Off-grid/unreachable → 1.0.
 static inline float labyrinth_dist_norm_at(const LabyrinthEnv* env, int gx, int gy) {
     if (gx < 0 || gx >= LABYRINTH_GRID_W || gy < 0 || gy >= LABYRINTH_GRID_H)
         return 1.0f;
@@ -713,9 +632,7 @@ static inline float labyrinth_dist_norm_at(const LabyrinthEnv* env, int gx, int 
     return n;
 }
 
-// Look up the ball's current BFS-distance-to-goal, normalized to [0, 1].
-// 0 = at the goal, 1 = maximum-distance reachable cell. Off-board positions
-// clamp to the nearest grid cell (so the BFS field is always defined).
+// Same, but for the ball's current cell. Off-board ball clamps in-grid.
 static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     int gx = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
     int gy = (int)(env->phys.ball_y / LABYRINTH_VIEW_CELL_M);
@@ -726,11 +643,8 @@ static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     return labyrinth_dist_norm_at(env, gx, gy);
 }
 
-// Build the observation buffer: a 15x15 local window centered on the ball,
-// plus 8 scalar features (last one is progress-along-path).
 static inline void compute_observations(LabyrinthEnv* env) {
     const Labyrinth* p = &env->phys;
-    // Ball's grid-cell center. Window spans [center-VISION, center+VISION].
     int gx_center = (int)(p->ball_x / LABYRINTH_VIEW_CELL_M);
     int gy_center = (int)(p->ball_y / LABYRINTH_VIEW_CELL_M);
     float* o = env->observations;
@@ -761,13 +675,10 @@ static inline void compute_observations(LabyrinthEnv* env) {
     o[LABYRINTH_VIEW_SIZE + 7] = labyrinth_dist_to_goal_norm(env);
 }
 
-// Start a new episode: rotate the maze seed, regenerate maze, write obs.
 static inline void c_reset(LabyrinthEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
     env->maze_seed += 1u;
-    // Per-env curriculum: linear ramp in episode count from difficulty_start
-    // up to full difficulty (1.0) over curriculum_episodes episodes.
     float difficulty = env->difficulty_start;
     if (env->curriculum_episodes > 0) {
         float progress = (float)env->episode_count / (float)env->curriculum_episodes;
@@ -778,18 +689,14 @@ static inline void c_reset(LabyrinthEnv* env) {
     labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, difficulty);
     build_grid(env);
     build_distance_field(env);
-    env->prev_dist_norm = labyrinth_dist_to_goal_norm(env);
+    env->min_dist_norm_seen = labyrinth_dist_to_goal_norm(env);
     compute_observations(env);
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0.0f;
     env->episode_count += 1;
 }
 
-// Apply action, advance physics, compute reward/terminal/obs.
 static inline void c_step(LabyrinthEnv* env) {
-    // Continuous action: clamp to [-1, 1], scale to physical tilt range.
-    // Setting tilt directly each step (rather than integrating an increment)
-    // gives the agent fine-grained motor control of the board.
     float ax = env->actions[0];
     float ay = env->actions[1];
     if (ax < -1.0f) ax = -1.0f;
@@ -799,8 +706,6 @@ static inline void c_step(LabyrinthEnv* env) {
     env->phys.tilt_x = ax * MAX_TILT_RAD;
     env->phys.tilt_y = ay * MAX_TILT_RAD;
 
-    // Run multiple physics substeps per agent decision. Early-exit on
-    // terminal so we don't keep simulating after the episode ends.
     for (int i = 0; i < env->physics_substeps; i++) {
         labyrinth_step(&env->phys);
         if (env->phys.reached_goal || env->phys.fell_in_hole)
@@ -808,33 +713,24 @@ static inline void c_step(LabyrinthEnv* env) {
     }
     env->tick += 1;
 
-    // Potential-based reward shaping (see LABYRINTH_SHAPING_GAMMA block above
-    // for the derivation). Force φ(terminal)=0 so the discounted cumulative
-    // shaping telescopes to a policy-invariant −φ(s_0).
-    int terminal = 0;
-    if (env->phys.reached_goal || env->phys.fell_in_hole || env->tick >= env->max_steps)
-        terminal = 1;
     float cur_dist_norm = labyrinth_dist_to_goal_norm(env);
-    float phi_cur  = terminal ? 0.0f
-                              : LABYRINTH_POTENTIAL_SCALE * (1.0f - cur_dist_norm);
-    float phi_prev = LABYRINTH_POTENTIAL_SCALE * (1.0f - env->prev_dist_norm);
-    float shaping = LABYRINTH_SHAPING_GAMMA * phi_cur - phi_prev;
-    env->prev_dist_norm = cur_dist_norm;
+    float dist_delta = env->min_dist_norm_seen - cur_dist_norm;
+    if (dist_delta < 0.0f)
+        dist_delta = 0.0f;
+    if (cur_dist_norm < env->min_dist_norm_seen)
+        env->min_dist_norm_seen = cur_dist_norm;
 
-    float r = shaping - LABYRINTH_STEP_PENALTY;
-    // On-path bonus: if the ball's current view-grid cell is tagged PATH,
-    // pay a small per-step reward.
-    int gx_cell = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
-    int gy_cell = (int)(env->phys.ball_y / LABYRINTH_VIEW_CELL_M);
-    if (gx_cell >= 0 && gx_cell < LABYRINTH_GRID_W &&
-        gy_cell >= 0 && gy_cell < LABYRINTH_GRID_H &&
-        env->grid[gy_cell * LABYRINTH_GRID_W + gx_cell] == LABYRINTH_CELL_PATH) {
-        r += LABYRINTH_ON_PATH_BONUS;
-    }
-    if (env->phys.reached_goal)
+    float r = dist_delta * LABYRINTH_PROGRESS_REWARD_SCALE - LABYRINTH_STEP_PENALTY;
+    int terminal = 0;
+    if (env->phys.reached_goal) {
         r += 1.0f;
-    else if (env->phys.fell_in_hole)
+        terminal = 1;
+    } else if (env->phys.fell_in_hole) {
         r += -1.0f;
+        terminal = 1;
+    } else if (env->tick >= env->max_steps) {
+        terminal = 1;
+    }
     env->rewards[0] = r;
     env->terminals[0] = (float)terminal;
     env->episode_return += r;
@@ -847,7 +743,6 @@ static inline void c_step(LabyrinthEnv* env) {
     }
 }
 
-// Raylib render. Lazy-inits the window on first call.
 static inline void c_render(LabyrinthEnv* env) {
     if (env->client == NULL) {
         env->client = (Client*)calloc(1, sizeof(Client));
