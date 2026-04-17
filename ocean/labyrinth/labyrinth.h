@@ -426,7 +426,7 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_CURRICULUM_WINDOW 0
 #define LABYRINTH_CURRICULUM_MAX_WINDOW 64
 #define LABYRINTH_CURRICULUM_THRESHOLD 0.5f
-#define LABYRINTH_CURRICULUM_STEP 0.1f
+#define LABYRINTH_CURRICULUM_STEP 0.05f
 
 typedef struct Log {
     float perf;           // normalized score in [0, 1]: 1.0 if reached goal
