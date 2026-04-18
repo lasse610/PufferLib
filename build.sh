@@ -54,7 +54,18 @@ fi
 PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
-    OMP_LIB=-lomp5
+    # The static lib compiles with clang (LLVM libomp symbols: __kmpc_*), so
+    # the final link needs libomp — not libgomp. Prefer system libomp; fall
+    # back to a locally-staged copy in build/extralibs/ (see CUDA link step).
+    if ldconfig -p 2>/dev/null | grep -q 'libomp\.so'; then
+        OMP_LIB=-lomp
+    elif [ -f build/extralibs/libomp.so ] || [ -f build/extralibs/libomp.so.5 ]; then
+        OMP_LIB=-lomp
+    elif ldconfig -p 2>/dev/null | grep -q 'libgomp\.so'; then
+        OMP_LIB=-lgomp
+    else
+        OMP_LIB=-lomp
+    fi
     OMP_CFLAGS=(-fopenmp)
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
@@ -196,6 +207,28 @@ if [ -z "$CUDNN_LFLAG" ]; then
     CUDNN_LFLAG=$(python -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
+# Find NCCL path (mirrors cuDNN logic)
+NCCL_IFLAG=""
+NCCL_LFLAG=""
+for dir in /usr/local/cuda/include /usr/include; do
+    if [ -f "$dir/nccl.h" ]; then
+        NCCL_IFLAG="-I$dir"
+        break
+    fi
+done
+for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
+    if [ -f "$dir/libnccl.so" ]; then
+        NCCL_LFLAG="-L$dir"
+        break
+    fi
+done
+if [ -z "$NCCL_IFLAG" ]; then
+    NCCL_IFLAG=$(python -c "import nvidia.nccl, os; print('-I' + os.path.join(nvidia.nccl.__path__[0], 'include'))" 2>/dev/null || echo "")
+fi
+if [ -z "$NCCL_LFLAG" ]; then
+    NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
+fi
+
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
@@ -245,17 +278,27 @@ if [ -z "$MODE" ]; then
         -std=c++17 \
         -I. -Isrc \
         -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-        -I$CUDA_HOME/include $CUDNN_IFLAG -I$RAYLIB_NAME/include \
+        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG -I$RAYLIB_NAME/include \
         -Xcompiler=-fopenmp \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         $PRECISION $NVCC_OPT \
         src/bindings.cu -o build/bindings.o
 
+    # Some Linux installs ship only libnvidia-ml.so.1 (no .so symlink). Provide
+    # a local fallback in build/extralibs/ so the linker can find it.
+    mkdir -p build/extralibs
+    if [ ! -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so ] && [ -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 ]; then
+        ln -sf /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 build/extralibs/libnvidia-ml.so
+    fi
+    EXTRA_LFLAG="-Lbuild/extralibs"
+    EXTRA_RPATH="-Wl,-rpath,\$ORIGIN/../build/extralibs"
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
         build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-        -L$CUDA_HOME/lib64 $CUDNN_LFLAG
+        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG $EXTRA_LFLAG
+        -Wl,-rpath,$(echo "$NCCL_LFLAG" | sed 's/^-L//')
+        $EXTRA_RPATH
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
         $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"

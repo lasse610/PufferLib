@@ -318,6 +318,94 @@ static inline void labyrinth_load_random_maze(Labyrinth* env, uint32_t seed) {
     labyrinth_generate_grid_maze(env, seed, 6, 7, 0.5f, 0);
 }
 
+// ===== Path / hole observation helpers =====
+// Fill `len_from[i]` with the path length from path_points[i] to the goal.
+// Sets `*total` = len_from[0]. If path has < 2 points, all values are 0.
+static inline void labyrinth_path_lengths(const Labyrinth* env,
+        float len_from[MAX_PATH_POINTS], float* total) {
+    int n = env->num_path_points;
+    for (int i = 0; i < MAX_PATH_POINTS; i++) len_from[i] = 0.0f;
+    if (n < 2) { *total = 0.0f; return; }
+    len_from[n - 1] = 0.0f;
+    for (int i = n - 2; i >= 0; i--) {
+        float dx = env->path_points[i + 1][0] - env->path_points[i][0];
+        float dy = env->path_points[i + 1][1] - env->path_points[i][1];
+        len_from[i] = len_from[i + 1] + sqrtf(dx * dx + dy * dy);
+    }
+    *total = len_from[0];
+}
+
+// Closest point on the path polyline to (px, py). Returns segment index and
+// parametric t [0,1] along that segment. Falls back to goal coords when path
+// has < 2 points.
+static inline void labyrinth_nearest_path_point(const Labyrinth* env,
+        float px, float py, float* out_x, float* out_y, int* seg, float* t_out) {
+    if (env->num_path_points < 2) {
+        *out_x = env->goal_cx; *out_y = env->goal_cy;
+        *seg = 0; *t_out = 0.0f;
+        return;
+    }
+    float best_d2 = 1e30f;
+    float best_x = env->path_points[0][0], best_y = env->path_points[0][1];
+    int   best_i = 0;
+    float best_t = 0.0f;
+    for (int i = 0; i + 1 < env->num_path_points; i++) {
+        float ax = env->path_points[i][0], ay = env->path_points[i][1];
+        float bx = env->path_points[i + 1][0], by = env->path_points[i + 1][1];
+        float qx, qy;
+        closest_point_on_segment(ax, ay, bx, by, px, py, &qx, &qy);
+        float dx = px - qx, dy = py - qy;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_x = qx; best_y = qy;
+            best_i = i;
+            float seg_dx = bx - ax, seg_dy = by - ay;
+            float seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
+            if (seg_len2 < 1e-12f) {
+                best_t = 0.0f;
+            } else {
+                best_t = ((qx - ax) * seg_dx + (qy - ay) * seg_dy) / seg_len2;
+                if (best_t < 0.0f) best_t = 0.0f;
+                if (best_t > 1.0f) best_t = 1.0f;
+            }
+        }
+    }
+    *out_x = best_x; *out_y = best_y;
+    *seg = best_i; *t_out = best_t;
+}
+
+// Unit tangent of the path at the given segment (pointing toward goal).
+static inline void labyrinth_path_tangent(const Labyrinth* env, int seg,
+        float* tx, float* ty) {
+    if (seg < 0 || seg + 1 >= env->num_path_points) { *tx = 0.0f; *ty = 0.0f; return; }
+    float dx = env->path_points[seg + 1][0] - env->path_points[seg][0];
+    float dy = env->path_points[seg + 1][1] - env->path_points[seg][1];
+    float n = sqrtf(dx * dx + dy * dy);
+    if (n < 1e-9f) { *tx = 0.0f; *ty = 0.0f; return; }
+    *tx = dx / n; *ty = dy / n;
+}
+
+// Nearest hole to (px, py). Sets dx/dy as offset (hole_center - ball) and dist
+// as the euclidean distance. With no holes, returns dx=dy=0, dist=board_diag.
+static inline void labyrinth_nearest_hole(const Labyrinth* env, float px, float py,
+        float* out_dx, float* out_dy, float* out_dist) {
+    float diag = sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
+    if (env->num_holes == 0) {
+        *out_dx = 0.0f; *out_dy = 0.0f; *out_dist = diag;
+        return;
+    }
+    float best_d2 = 1e30f;
+    float best_dx = 0.0f, best_dy = 0.0f;
+    for (int i = 0; i < env->num_holes; i++) {
+        float dx = env->holes[i].cx - px;
+        float dy = env->holes[i].cy - py;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) { best_d2 = d2; best_dx = dx; best_dy = dy; }
+    }
+    *out_dx = best_dx; *out_dy = best_dy; *out_dist = sqrtf(best_d2);
+}
+
 // Curriculum maze: smaller 4×5 layout, only barrier_prob ramps with difficulty.
 // 4×5 = 20 cells, max ~6 hole-barriers at d=1.0 — within reach for our PPO
 // setup. The 6×7 with up to 25 hole-barriers proved untrainable.

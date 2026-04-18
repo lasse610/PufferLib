@@ -427,7 +427,8 @@ def eval(env_name, args=None, load_path=None):
         print(f'Loaded weights from {load_path}')
 
     while True:
-        if args.get('render_mode') != 'none':
+        rm = args.get('render_mode')
+        if rm not in ('none', 'None', None):
             backend.render(pufferl, 0)
         backend.rollouts(pufferl)
 

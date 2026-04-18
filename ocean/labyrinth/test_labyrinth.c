@@ -591,6 +591,307 @@ static void test_reset_is_idempotent(void) {
     EXPECT(env.num_walls == 4, "reset leaves the 4 border walls", "unexpected wall count");
 }
 
+// ---- Path / hole observation helper tests ----
+
+// Build a Labyrinth with the given polyline as its path (border walls stay
+// from labyrinth_reset; no holes). Path is in the env's world frame.
+static void make_env_with_path(Labyrinth* env, const float (*pts)[2], int n) {
+    labyrinth_reset(env);
+    env->num_path_points = n;
+    for (int i = 0; i < n && i < MAX_PATH_POINTS; i++) {
+        env->path_points[i][0] = pts[i][0];
+        env->path_points[i][1] = pts[i][1];
+    }
+}
+
+static void test_path_lengths_simple(void) {
+    printf("labyrinth_path_lengths: cumulative lengths for known polyline\n");
+    Labyrinth env = {0};
+    // Two segments: (0,0)→(0.10,0)=0.10, (0.10,0)→(0.10,0.05)=0.05. Total=0.15.
+    float pts[3][2] = {{0.00f, 0.00f}, {0.10f, 0.00f}, {0.10f, 0.05f}};
+    make_env_with_path(&env, pts, 3);
+    float len_from[MAX_PATH_POINTS];
+    float total = -1.0f;
+    labyrinth_path_lengths(&env, len_from, &total);
+    EXPECT_NEAR(total, 0.15f, 1e-6f, "total path length");
+    EXPECT_NEAR(len_from[0], 0.15f, 1e-6f, "len_from[0] == total");
+    EXPECT_NEAR(len_from[1], 0.05f, 1e-6f, "len_from[1] (after first seg)");
+    EXPECT_NEAR(len_from[2], 0.00f, 1e-6f, "len_from[end] == 0");
+}
+
+static void test_path_lengths_degenerate(void) {
+    printf("labyrinth_path_lengths: degenerate paths (0 / 1 points)\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    env.num_path_points = 0;
+    float len_from[MAX_PATH_POINTS];
+    float total = 999.0f;
+    labyrinth_path_lengths(&env, len_from, &total);
+    EXPECT_NEAR(total, 0.0f, 1e-9f, "0-point path: total=0");
+    EXPECT_NEAR(len_from[0], 0.0f, 1e-9f, "0-point path: len_from[0]=0");
+    env.num_path_points = 1;
+    env.path_points[0][0] = 0.05f;
+    env.path_points[0][1] = 0.07f;
+    total = 999.0f;
+    labyrinth_path_lengths(&env, len_from, &total);
+    EXPECT_NEAR(total, 0.0f, 1e-9f, "1-point path: total=0");
+}
+
+static void test_nearest_path_point_on_path(void) {
+    printf("labyrinth_nearest_path_point: ball on path → offset ≈ 0\n");
+    Labyrinth env = {0};
+    float pts[3][2] = {{0.00f, 0.10f}, {0.20f, 0.10f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 3);
+    float ox, oy; int seg; float t;
+    // Midpoint of first segment.
+    labyrinth_nearest_path_point(&env, 0.10f, 0.10f, &ox, &oy, &seg, &t);
+    EXPECT_NEAR(ox, 0.10f, 1e-6f, "on-path: out_x");
+    EXPECT_NEAR(oy, 0.10f, 1e-6f, "on-path: out_y");
+    EXPECT(seg == 0, "on-path: seg=0", "wrong segment");
+    EXPECT_NEAR(t, 0.5f, 1e-6f, "on-path: t=0.5");
+}
+
+static void test_nearest_path_point_off_path(void) {
+    printf("labyrinth_nearest_path_point: ball off path → correct projection\n");
+    Labyrinth env = {0};
+    float pts[2][2] = {{0.00f, 0.10f}, {0.20f, 0.10f}};
+    make_env_with_path(&env, pts, 2);
+    float ox, oy; int seg; float t;
+    // Ball at (0.05, 0.13) — projects perpendicularly onto y=0.10 line.
+    labyrinth_nearest_path_point(&env, 0.05f, 0.13f, &ox, &oy, &seg, &t);
+    EXPECT_NEAR(ox, 0.05f, 1e-6f, "off-path: out_x");
+    EXPECT_NEAR(oy, 0.10f, 1e-6f, "off-path: out_y");
+    EXPECT(seg == 0, "off-path: seg=0", "wrong segment");
+    EXPECT_NEAR(t, 0.25f, 1e-6f, "off-path: t=0.25");
+}
+
+static void test_nearest_path_point_clamp_to_endpoint(void) {
+    printf("labyrinth_nearest_path_point: query past segment end clamps to endpoint\n");
+    Labyrinth env = {0};
+    float pts[2][2] = {{0.00f, 0.10f}, {0.20f, 0.10f}};
+    make_env_with_path(&env, pts, 2);
+    float ox, oy; int seg; float t;
+    // Ball way past the right end.
+    labyrinth_nearest_path_point(&env, 0.50f, 0.10f, &ox, &oy, &seg, &t);
+    EXPECT_NEAR(ox, 0.20f, 1e-6f, "clamp-end: out_x snaps to endpoint");
+    EXPECT_NEAR(oy, 0.10f, 1e-6f, "clamp-end: out_y");
+    EXPECT_NEAR(t, 1.0f, 1e-6f, "clamp-end: t=1");
+    // Ball way before the left end.
+    labyrinth_nearest_path_point(&env, -0.30f, 0.10f, &ox, &oy, &seg, &t);
+    EXPECT_NEAR(ox, 0.00f, 1e-6f, "clamp-start: out_x snaps to endpoint");
+    EXPECT_NEAR(t, 0.0f, 1e-6f, "clamp-start: t=0");
+}
+
+static void test_nearest_path_point_multi_segment(void) {
+    printf("labyrinth_nearest_path_point: multi-segment picks closest segment\n");
+    Labyrinth env = {0};
+    // L-shape: horizontal then vertical.
+    float pts[3][2] = {{0.00f, 0.10f}, {0.20f, 0.10f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 3);
+    float ox, oy; int seg; float t;
+    // Ball clearly closest to the second (vertical) segment.
+    labyrinth_nearest_path_point(&env, 0.22f, 0.15f, &ox, &oy, &seg, &t);
+    EXPECT(seg == 1, "multi-seg: picks vertical seg", "wrong segment chosen");
+    EXPECT_NEAR(ox, 0.20f, 1e-6f, "multi-seg: projects onto x=0.20");
+    EXPECT_NEAR(oy, 0.15f, 1e-6f, "multi-seg: out_y");
+    EXPECT_NEAR(t, 0.5f, 1e-6f, "multi-seg: t=0.5 along vertical");
+}
+
+static void test_nearest_path_point_empty_path(void) {
+    printf("labyrinth_nearest_path_point: empty path falls back to goal\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    env.num_path_points = 0;
+    env.goal_cx = 0.123f; env.goal_cy = 0.045f;
+    float ox, oy; int seg; float t;
+    labyrinth_nearest_path_point(&env, 0.5f, 0.5f, &ox, &oy, &seg, &t);
+    EXPECT_NEAR(ox, 0.123f, 1e-9f, "empty path: out_x = goal_cx");
+    EXPECT_NEAR(oy, 0.045f, 1e-9f, "empty path: out_y = goal_cy");
+}
+
+static void test_path_tangent_unit_and_direction(void) {
+    printf("labyrinth_path_tangent: unit length and correct direction\n");
+    Labyrinth env = {0};
+    // Diagonal segment, then horizontal.
+    float pts[3][2] = {{0.00f, 0.00f}, {0.03f, 0.04f}, {0.13f, 0.04f}};
+    make_env_with_path(&env, pts, 3);
+    float tx, ty;
+    labyrinth_path_tangent(&env, 0, &tx, &ty);
+    // (0.03, 0.04) length 0.05 → unit (0.6, 0.8).
+    EXPECT_NEAR(tx, 0.6f, 1e-6f, "diag tangent x");
+    EXPECT_NEAR(ty, 0.8f, 1e-6f, "diag tangent y");
+    EXPECT_NEAR(sqrtf(tx * tx + ty * ty), 1.0f, 1e-6f, "diag tangent unit length");
+    labyrinth_path_tangent(&env, 1, &tx, &ty);
+    EXPECT_NEAR(tx, 1.0f, 1e-6f, "horiz tangent x");
+    EXPECT_NEAR(ty, 0.0f, 1e-6f, "horiz tangent y");
+}
+
+static void test_path_tangent_out_of_range(void) {
+    printf("labyrinth_path_tangent: out-of-range seg → zero vector\n");
+    Labyrinth env = {0};
+    float pts[2][2] = {{0.00f, 0.00f}, {0.10f, 0.00f}};
+    make_env_with_path(&env, pts, 2);
+    float tx = 99.0f, ty = 99.0f;
+    labyrinth_path_tangent(&env, -1, &tx, &ty);
+    EXPECT_NEAR(tx, 0.0f, 1e-9f, "negative seg: tx=0");
+    EXPECT_NEAR(ty, 0.0f, 1e-9f, "negative seg: ty=0");
+    tx = 99.0f; ty = 99.0f;
+    labyrinth_path_tangent(&env, 5, &tx, &ty); // beyond last seg
+    EXPECT_NEAR(tx, 0.0f, 1e-9f, "past-end seg: tx=0");
+    EXPECT_NEAR(ty, 0.0f, 1e-9f, "past-end seg: ty=0");
+}
+
+static void test_nearest_hole_no_holes(void) {
+    printf("labyrinth_nearest_hole: zero holes → diag sentinel\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    env.num_holes = 0;
+    float dx = 99.0f, dy = 99.0f, d = 99.0f;
+    labyrinth_nearest_hole(&env, 0.05f, 0.05f, &dx, &dy, &d);
+    EXPECT_NEAR(dx, 0.0f, 1e-9f, "no holes: dx=0");
+    EXPECT_NEAR(dy, 0.0f, 1e-9f, "no holes: dy=0");
+    float diag = sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
+    EXPECT_NEAR(d, diag, 1e-6f, "no holes: dist=board_diag");
+}
+
+static void test_nearest_hole_single(void) {
+    printf("labyrinth_nearest_hole: single hole → exact offset\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    labyrinth_add_hole(&env, 0.10f, 0.20f, 1.3f * BALL_RADIUS);
+    float dx, dy, d;
+    labyrinth_nearest_hole(&env, 0.07f, 0.16f, &dx, &dy, &d);
+    EXPECT_NEAR(dx, 0.03f, 1e-6f, "single hole: dx=hole-ball");
+    EXPECT_NEAR(dy, 0.04f, 1e-6f, "single hole: dy=hole-ball");
+    EXPECT_NEAR(d, 0.05f, 1e-6f, "single hole: dist=5cm (3-4-5)");
+}
+
+static void test_nearest_hole_picks_closest(void) {
+    printf("labyrinth_nearest_hole: multiple holes → picks closest\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    labyrinth_add_hole(&env, 0.05f, 0.05f, 1.3f * BALL_RADIUS); // far
+    labyrinth_add_hole(&env, 0.21f, 0.20f, 1.3f * BALL_RADIUS); // closest
+    labyrinth_add_hole(&env, 0.28f, 0.05f, 1.3f * BALL_RADIUS); // far
+    float dx, dy, d;
+    labyrinth_nearest_hole(&env, 0.20f, 0.20f, &dx, &dy, &d);
+    EXPECT_NEAR(dx, 0.01f, 1e-6f, "multi-hole: dx of closest");
+    EXPECT_NEAR(dy, 0.00f, 1e-6f, "multi-hole: dy of closest");
+    EXPECT_NEAR(d, 0.01f, 1e-6f, "multi-hole: dist of closest");
+}
+
+// Integration: replicate compute_observations() against a known geometry and
+// verify all 13 values are correct and within their declared ranges.
+static void test_full_obs_known_geometry(void) {
+    printf("compute_observations: 13-dim obs on known geometry\n");
+    Labyrinth env = {0};
+    // Two-segment L-path. Ball starts at (0.05, 0.10) — exactly on first seg.
+    float pts[3][2] = {{0.00f, 0.10f}, {0.20f, 0.10f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 3);
+    env.ball_x = 0.05f; env.ball_y = 0.10f;
+    env.ball_vx = 0.5f; env.ball_vy = -0.4f; env.ball_vz = 0.0f;
+    env.tilt_x = 0.5f * MAX_TILT_RAD;
+    env.tilt_y = -0.25f * MAX_TILT_RAD;
+    labyrinth_add_hole(&env, 0.08f, 0.14f, 1.3f * BALL_RADIUS);
+
+    float len_from[MAX_PATH_POINTS]; float total;
+    labyrinth_path_lengths(&env, len_from, &total);
+    // total = 0.20 (horiz) + 0.10 (vert) = 0.30
+    EXPECT_NEAR(total, 0.30f, 1e-6f, "obs setup: total path len = 0.30");
+
+    // Replicate compute_observations() body.
+    float o[13];
+    const float inv_vmax = 1.0f / 2.0f;
+    const float inv_t = 1.0f / MAX_TILT_RAD;
+    const float inv_w = 1.0f / BOARD_W;
+    const float inv_h = 1.0f / BOARD_H;
+    const float diag = sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
+    o[0] = env.ball_vx * inv_vmax;
+    o[1] = env.ball_vy * inv_vmax;
+    o[2] = env.ball_vz * inv_vmax;
+    o[3] = env.tilt_x * inv_t;
+    o[4] = env.tilt_y * inv_t;
+    float ppx, ppy, ptx, pty; int seg; float tt;
+    labyrinth_nearest_path_point(&env, env.ball_x, env.ball_y, &ppx, &ppy, &seg, &tt);
+    labyrinth_path_tangent(&env, seg, &ptx, &pty);
+    o[5] = (ppx - env.ball_x) * inv_w;
+    o[6] = (ppy - env.ball_y) * inv_h;
+    o[7] = ptx; o[8] = pty;
+    float dist_remaining = (1.0f - tt) * (len_from[seg] - len_from[seg + 1]) + len_from[seg + 1];
+    o[9] = (total > 1e-9f) ? (dist_remaining / total) : 0.0f;
+    float hdx, hdy, hd;
+    labyrinth_nearest_hole(&env, env.ball_x, env.ball_y, &hdx, &hdy, &hd);
+    o[10] = hdx * inv_w; o[11] = hdy * inv_h; o[12] = hd / diag;
+
+    // Ball v scaled (0.25, -0.20, 0).
+    EXPECT_NEAR(o[0], 0.25f, 1e-6f, "obs[0] = vx/2");
+    EXPECT_NEAR(o[1], -0.20f, 1e-6f, "obs[1] = vy/2");
+    EXPECT_NEAR(o[2], 0.0f, 1e-6f, "obs[2] = vz/2");
+    EXPECT_NEAR(o[3], 0.5f, 1e-6f, "obs[3] = tilt_x/MAX");
+    EXPECT_NEAR(o[4], -0.25f, 1e-6f, "obs[4] = tilt_y/MAX");
+    // Ball ON segment 0 → offset (0,0).
+    EXPECT_NEAR(o[5], 0.0f, 1e-6f, "obs[5] path offset x ≈ 0");
+    EXPECT_NEAR(o[6], 0.0f, 1e-6f, "obs[6] path offset y ≈ 0");
+    EXPECT_NEAR(o[7], 1.0f, 1e-6f, "obs[7] tangent x = +1");
+    EXPECT_NEAR(o[8], 0.0f, 1e-6f, "obs[8] tangent y = 0");
+    // dist remaining at (0.05, 0.10) along seg 0 (t=0.25): 0.15 + 0.10 = 0.25 / 0.30
+    EXPECT_NEAR(o[9], 0.25f / 0.30f, 1e-5f, "obs[9] dist_along normalized");
+    // Hole at (0.08, 0.14), ball (0.05, 0.10): offset (0.03, 0.04), dist 0.05.
+    EXPECT_NEAR(o[10], 0.03f / BOARD_W, 1e-6f, "obs[10] hole offset x");
+    EXPECT_NEAR(o[11], 0.04f / BOARD_H, 1e-6f, "obs[11] hole offset y");
+    EXPECT_NEAR(o[12], 0.05f / diag, 1e-6f, "obs[12] hole dist normalized");
+
+    // Range bounds — the policy assumes obs in roughly [-1, 1].
+    int all_in_range = 1;
+    for (int i = 0; i < 13; i++) {
+        if (o[i] < -1.5f || o[i] > 1.5f) { all_in_range = 0; break; }
+    }
+    EXPECT(all_in_range, "all 13 obs values in [-1.5, 1.5]", "out-of-range value");
+}
+
+// Procedural-maze integration: build a real curriculum maze, cache lengths,
+// and confirm the obs computation does not crash and produces in-range values
+// across many seeds and difficulties.
+static void test_obs_on_procedural_maze(void) {
+    printf("compute_observations: in-range values across many procedural mazes\n");
+    int total = 0, in_range = 0;
+    for (uint32_t seed = 1; seed <= 60; seed++) {
+        for (int di = 0; di <= 4; di++) {
+            float difficulty = di * 0.25f;
+            Labyrinth env = {0};
+            labyrinth_reset(&env);
+            labyrinth_load_curriculum_maze(&env, seed, difficulty);
+            if (env.num_path_points < 2) continue;
+            float len_from[MAX_PATH_POINTS]; float tot;
+            labyrinth_path_lengths(&env, len_from, &tot);
+            float ppx, ppy, ptx, pty; int seg; float tt;
+            labyrinth_nearest_path_point(&env, env.ball_x, env.ball_y, &ppx, &ppy, &seg, &tt);
+            labyrinth_path_tangent(&env, seg, &ptx, &pty);
+            float hdx, hdy, hd;
+            labyrinth_nearest_hole(&env, env.ball_x, env.ball_y, &hdx, &hdy, &hd);
+            float diag = sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
+            float vals[8] = {
+                (ppx - env.ball_x) / BOARD_W,
+                (ppy - env.ball_y) / BOARD_H,
+                ptx, pty,
+                (1.0f - tt) * (len_from[seg] - len_from[seg + 1]) + len_from[seg + 1],
+                hdx / BOARD_W, hdy / BOARD_H, hd / diag,
+            };
+            // Normalize the dist_along for the range check.
+            vals[4] = (tot > 1e-9f) ? vals[4] / tot : 0.0f;
+            int ok = 1;
+            for (int k = 0; k < 8; k++) {
+                if (vals[k] < -1.01f || vals[k] > 1.01f) { ok = 0; break; }
+            }
+            if (ok) in_range++;
+            total++;
+        }
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "%d / %d (seed,diff) configs in range", in_range, total);
+    EXPECT(in_range == total && total > 0, "procedural mazes all in [-1,1]", msg);
+}
+
 int main(void) {
     printf("labyrinth physics tests\n");
     printf("=======================\n");
@@ -614,6 +915,20 @@ int main(void) {
     test_grid_maze_start_and_goal_are_safe();
     test_reset_clears_fall_state();
     test_reset_is_idempotent();
+    test_path_lengths_simple();
+    test_path_lengths_degenerate();
+    test_nearest_path_point_on_path();
+    test_nearest_path_point_off_path();
+    test_nearest_path_point_clamp_to_endpoint();
+    test_nearest_path_point_multi_segment();
+    test_nearest_path_point_empty_path();
+    test_path_tangent_unit_and_direction();
+    test_path_tangent_out_of_range();
+    test_nearest_hole_no_holes();
+    test_nearest_hole_single();
+    test_nearest_hole_picks_closest();
+    test_full_obs_known_geometry();
+    test_obs_on_procedural_maze();
     printf("\n%d / %d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed == 0 ? 0 : 1;
 }
