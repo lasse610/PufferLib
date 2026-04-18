@@ -400,19 +400,12 @@ static inline void draw_board(const Labyrinth* env) {
 #define LABYRINTH_CELL_GOAL  3
 #define LABYRINTH_CELL_PATH  4
 
-// 13-dim task-direct obs: tells the policy where it is relative to the
-// BFS-optimal path and to the closest hole. No raster — the maze layout
-// is summarized by the path itself.
-//   [0..2]  ball_v{x,y,z}          (m/s, scaled by 1/2)
-//   [3..4]  tilt_{x,y}             (rad, scaled by 1/MAX_TILT_RAD)
-//   [5..6]  path_offset_{x,y}      ball→nearest path point (board-fraction)
-//   [7..8]  path_tangent_{x,y}     unit vector "go this way" along path
-//   [9]     dist_along_path        remaining distance to goal along the path,
-//                                  normalized by total path length
-//   [10..11] hole_offset_{x,y}     ball→nearest hole (board-fraction)
-//   [12]    hole_dist              euclidean dist to nearest hole, normalized
-//                                  by board diagonal; 1.0 means "no hole"
-#define LABYRINTH_SCALAR_FEATURES 13
+// 8 scalar features alongside the egocentric raster view:
+//   [0..2] ball_v{x,y,z}        (scaled by 1/2)
+//   [3..4] tilt_{x,y}           (scaled by 1/MAX_TILT_RAD)
+//   [5..6] goal_offset_{x,y}    (ball→goal, board-fraction)
+//   [7]    bfs_dist_norm        (BFS distance at ball's cell / max_dist)
+#define LABYRINTH_SCALAR_FEATURES 8
 
 // Potential-based shaping (Ng 1999): F = γ·φ(s') − φ(s),
 // with φ(s) = k · (1 − bfs_dist_norm) and φ(terminal) ≡ 0. Discounted
@@ -426,7 +419,7 @@ static inline void draw_board(const Labyrinth* env) {
 // stall-to-timeout is worse than falling.
 #define LABYRINTH_STEP_PENALTY 0.002f
 
-#define LABYRINTH_OBS_SIZE LABYRINTH_SCALAR_FEATURES
+#define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
 
 #define LABYRINTH_MAX_STEPS 2000
 
@@ -490,10 +483,6 @@ typedef struct LabyrinthEnv {
     unsigned short dist_to_goal[LABYRINTH_GRID_W * LABYRINTH_GRID_H];
     int max_dist;
     float prev_dist_norm;
-    // Cached path-length-from-segment-i-onwards (in meters). [0] = total path
-    // length, [n] = 0. Used to normalize the dist_along_path obs feature.
-    float path_len_from[MAX_PATH_POINTS];
-    float total_path_len;
 
     float difficulty_start;
     int curriculum_window;
@@ -686,46 +675,41 @@ static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     return labyrinth_dist_norm_at(env, gx, gy);
 }
 
-// Pre-compute per-segment cumulative path lengths so dist_along_path is O(1).
-static inline void cache_path_lengths(LabyrinthEnv* env) {
-    labyrinth_path_lengths(&env->phys, env->path_len_from, &env->total_path_len);
-}
-
 static inline void compute_observations(LabyrinthEnv* env) {
     const Labyrinth* p = &env->phys;
-    float* o = env->observations;
+    float* obs = env->observations;
+
+    // ---- 15×15 egocentric raster around the ball ----
+    int bgx = (int)(p->ball_x / LABYRINTH_VIEW_CELL_M);
+    int bgy = (int)(p->ball_y / LABYRINTH_VIEW_CELL_M);
+    int k = 0;
+    for (int dy = -LABYRINTH_VISION; dy <= LABYRINTH_VISION; dy++) {
+        for (int dx = -LABYRINTH_VISION; dx <= LABYRINTH_VISION; dx++) {
+            int gx = bgx + dx;
+            int gy = bgy + dy;
+            unsigned char cell;
+            if (gx < 0 || gx >= LABYRINTH_GRID_W || gy < 0 || gy >= LABYRINTH_GRID_H) {
+                cell = LABYRINTH_CELL_WALL;  // off-grid reads as wall
+            } else {
+                cell = env->grid[gy * LABYRINTH_GRID_W + gx];
+            }
+            obs[k++] = (float)cell;
+        }
+    }
+
+    // ---- 8 scalar features ----
     const float inv_vmax = 1.0f / 2.0f;
     const float inv_t = 1.0f / MAX_TILT_RAD;
     const float inv_w = 1.0f / BOARD_W;
     const float inv_h = 1.0f / BOARD_H;
-    const float diag = sqrtf(BOARD_W * BOARD_W + BOARD_H * BOARD_H);
-
-    o[0] = p->ball_vx * inv_vmax;
-    o[1] = p->ball_vy * inv_vmax;
-    o[2] = p->ball_vz * inv_vmax;
-    o[3] = p->tilt_x * inv_t;
-    o[4] = p->tilt_y * inv_t;
-
-    // Path-relative features.
-    float ppx, ppy, ptx, pty;
-    int seg;
-    float t;
-    labyrinth_nearest_path_point(p, p->ball_x, p->ball_y, &ppx, &ppy, &seg, &t);
-    labyrinth_path_tangent(p, seg, &ptx, &pty);
-    o[5] = (ppx - p->ball_x) * inv_w;        // offset toward path
-    o[6] = (ppy - p->ball_y) * inv_h;
-    o[7] = ptx;                               // unit tangent (already in [-1,1])
-    o[8] = pty;
-    float dist_remaining = (1.0f - t) * (env->path_len_from[seg] - env->path_len_from[seg + 1])
-                         + env->path_len_from[seg + 1];
-    o[9] = (env->total_path_len > 1e-9f) ? (dist_remaining / env->total_path_len) : 0.0f;
-
-    // Nearest-hole features.
-    float hdx, hdy, hd;
-    labyrinth_nearest_hole(p, p->ball_x, p->ball_y, &hdx, &hdy, &hd);
-    o[10] = hdx * inv_w;
-    o[11] = hdy * inv_h;
-    o[12] = hd / diag;
+    obs[k++] = p->ball_vx * inv_vmax;
+    obs[k++] = p->ball_vy * inv_vmax;
+    obs[k++] = p->ball_vz * inv_vmax;
+    obs[k++] = p->tilt_x * inv_t;
+    obs[k++] = p->tilt_y * inv_t;
+    obs[k++] = (p->goal_cx - p->ball_x) * inv_w;
+    obs[k++] = (p->goal_cy - p->ball_y) * inv_h;
+    obs[k++] = labyrinth_dist_to_goal_norm(env);
 }
 
 // Adaptive curriculum: record this episode's outcome in the sliding window;
@@ -759,7 +743,6 @@ static inline void c_reset(LabyrinthEnv* env) {
     labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, env->current_difficulty);
     build_grid(env);
     build_distance_field(env);
-    cache_path_lengths(env);
     env->prev_dist_norm = labyrinth_dist_to_goal_norm(env);
     compute_observations(env);
     env->rewards[0] = 0.0f;
