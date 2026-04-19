@@ -435,14 +435,20 @@ static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed,
                 on_path[r * cols + c] = 1;
         }
         uint32_t rng = (seed ^ 0xDEADBEEFu) | 1u;
-        uint32_t threshold = (uint32_t)(fill_frac * (float)0xFFFFFFFFu);
+        // 16-bit precision for the fill probability — avoids float→uint32
+        // overflow at fill_frac=1.0.
+        uint32_t threshold = (uint32_t)(fill_frac * 65536.0f);
         for (int r = 0; r < rows; r++) {
             for (int c = 0; c < cols; c++) {
                 if (on_path[r * cols + c]) continue;
-                if (lab_rng_next(&rng) < threshold) {
+                if ((lab_rng_next(&rng) & 0xFFFFu) < threshold) {
+                    // 2 holes per filled cell, vertically aligned at column
+                    // center, spaced like a barrier (1/4 from each cell edge).
                     float cx = (c + 0.5f) * cw;
-                    float cy = (r + 0.5f) * ch;
-                    labyrinth_add_hole(env, cx, cy, DEMO_HOLE_RADIUS);
+                    float cy_top = r * ch + 0.25f * ch;
+                    float cy_bot = (r + 1) * ch - 0.25f * ch;
+                    labyrinth_add_hole(env, cx, cy_top, DEMO_HOLE_RADIUS);
+                    labyrinth_add_hole(env, cx, cy_bot, DEMO_HOLE_RADIUS);
                 }
             }
         }
