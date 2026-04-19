@@ -526,7 +526,7 @@ static inline void init(LabyrinthEnv* env) {
     env->maze_seed = env->seed + env->rng;
     env->episode_return = 0.0f;
     env->client = NULL;
-    if (env->difficulty_start < 0.0f || env->difficulty_start > 1.0f)
+    if (env->difficulty_start < 0.0f || env->difficulty_start > 2.0f)
         env->difficulty_start = LABYRINTH_DIFFICULTY_START;
     if (env->curriculum_window < 0)
         env->curriculum_window = LABYRINTH_CURRICULUM_WINDOW;
@@ -547,7 +547,7 @@ static inline void add_log(LabyrinthEnv* env) {
     env->log.reached_goal += (float)won;
     env->log.fell_in_hole += (float)lost;
     env->log.avg_difficulty += env->current_difficulty;
-    int at_max = (env->current_difficulty >= 0.999f);
+    int at_max = (env->current_difficulty >= 1.999f);  // new max is 2.0
     env->log.at_max_eps += at_max ? 1.0f : 0.0f;
     env->log.at_max_solved += (at_max && won) ? 1.0f : 0.0f;
     env->log.n += 1.0f;
@@ -792,10 +792,16 @@ static inline void compute_observations(LabyrinthEnv* env) {
     obs[k++] = labyrinth_dist_to_goal_norm(env);
 }
 
+// Curriculum max raised to 2.0:
+//   d ∈ [0, 1] = spawn-position curriculum (ball spawns closer to goal at low d)
+//   d ∈ [1, 2] = barrier-prob ramps from 0.5 (current "max") up to 1.0 (every
+//                non-connected adjacency becomes a 2-hole barrier)
+#define LABYRINTH_CURRICULUM_MAX 2.0f
+
 // Adaptive curriculum: record this episode's outcome in the sliding window;
 // bump difficulty when >= threshold of the window are solved.
 static inline void labyrinth_curriculum_record(LabyrinthEnv* env, int solved) {
-    if (env->curriculum_window <= 0 || env->current_difficulty >= 1.0f)
+    if (env->curriculum_window <= 0 || env->current_difficulty >= LABYRINTH_CURRICULUM_MAX)
         return;
     env->recent_solves[env->recent_idx] = solved;
     env->recent_idx = (env->recent_idx + 1) % env->curriculum_window;
@@ -808,8 +814,8 @@ static inline void labyrinth_curriculum_record(LabyrinthEnv* env, int solved) {
         s += env->recent_solves[i];
     if (s * 1.0f / env->curriculum_window >= LABYRINTH_CURRICULUM_THRESHOLD) {
         env->current_difficulty += LABYRINTH_CURRICULUM_STEP;
-        if (env->current_difficulty > 1.0f)
-            env->current_difficulty = 1.0f;
+        if (env->current_difficulty > LABYRINTH_CURRICULUM_MAX)
+            env->current_difficulty = LABYRINTH_CURRICULUM_MAX;
         env->recent_count = 0;
         env->recent_idx = 0;
     }

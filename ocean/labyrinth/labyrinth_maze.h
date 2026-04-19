@@ -406,25 +406,24 @@ static inline void labyrinth_nearest_hole(const Labyrinth* env, float px, float 
 }
 
 // Curriculum maze: smaller 4×5 layout, only barrier_prob ramps with difficulty.
-// Reverse curriculum: maze structure is FIXED at full difficulty (4×5 with
-// 50% hole-barriers, ~6 hole-barriers per maze). Difficulty controls only
-// where the ball spawns along the BFS solution path:
-//   d=0   → ball spawns one path step from goal (almost trivial)
-//   d=0.5 → ball spawns mid-path
-//   d=1   → ball spawns at the original far start cell
-// Same env throughout; difficulty is purely how much of the trajectory the
-// agent has to figure out. Avoids the qualitative shift we had with
-// barrier-density curriculum (walls-only at d=0 → death-laden at d=1).
+// Two-phase curriculum:
+//   d ∈ [0, 1] → spawn-position curriculum, barrier_prob fixed at 0.5
+//                (d=0: ball one step from goal; d=1: ball at original far start)
+//   d ∈ [1, 2] → spawn at original start, barrier_prob ramps 0.5 → 1.0
+//                (d=2: every non-connected adjacency is a 2-hole barrier —
+//                much harder than the original "max" of d=1)
 static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed, float difficulty) {
     if (difficulty < 0.0f) difficulty = 0.0f;
-    if (difficulty > 1.0f) difficulty = 1.0f;
-    // Always max-difficulty maze structure.
-    labyrinth_generate_grid_maze(env, seed, 4, 5, 0.5f, 0);
-    // Override ball spawn to a path point closer to the goal at low difficulty.
+    if (difficulty > 2.0f) difficulty = 2.0f;
+    // Phase 2: bump barrier_prob above 0.5 once d > 1.
+    float barrier_prob = (difficulty > 1.0f) ? (0.5f + 0.5f * (difficulty - 1.0f)) : 0.5f;
+    labyrinth_generate_grid_maze(env, seed, 4, 5, barrier_prob, 0);
+    // Phase 1: spawn-position curriculum. For d>=1, spawn at original start.
+    float spawn_d = (difficulty < 1.0f) ? difficulty : 1.0f;
     if (env->num_path_points >= 2) {
         int last_idx = env->num_path_points - 2;  // one step before the goal cell
         if (last_idx < 0) last_idx = 0;
-        int spawn_idx = (int)((1.0f - difficulty) * (float)last_idx + 0.5f);
+        int spawn_idx = (int)((1.0f - spawn_d) * (float)last_idx + 0.5f);
         if (spawn_idx < 0) spawn_idx = 0;
         if (spawn_idx > last_idx) spawn_idx = last_idx;
         labyrinth_place_ball(env, env->path_points[spawn_idx][0], env->path_points[spawn_idx][1]);
