@@ -669,8 +669,8 @@ static inline void build_distance_field(LabyrinthEnv* env) {
     // distance, falling linearly to zero at HOLE_INFLATE_MARGIN_M from the rim.
     // Result: the agent strongly prefers wide corridors and only takes
     // hole-flanked routes when no alternative exists.
-    const float HOLE_INFLATE_MARGIN_M = 3.0f * LABYRINTH_VIEW_CELL_M;  // 18mm
-    const int   HOLE_INFLATE_PENALTY  = 20;
+    const float HOLE_INFLATE_MARGIN_M = 2.0f * LABYRINTH_VIEW_CELL_M;  // 12mm
+    const int   HOLE_INFLATE_PENALTY  = 5;
     if (env->phys.num_holes > 0) {
         for (int idx = 0; idx < N; idx++) {
             unsigned short d = env->dist_to_goal[idx];
