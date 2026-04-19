@@ -407,17 +407,47 @@ static inline void labyrinth_nearest_hole(const Labyrinth* env, float px, float 
 
 // Curriculum maze: smaller 4×5 layout, only barrier_prob ramps with difficulty.
 // Two-phase curriculum:
-//   d ∈ [0, 1] → spawn-position curriculum, barrier_prob fixed at 0.5
-//                (d=0: ball one step from goal; d=1: ball at original far start)
-//   d ∈ [1, 2] → spawn at original start, barrier_prob ramps 0.5 → 1.0
-//                (d=2: every non-connected adjacency is a 2-hole barrier —
-//                much harder than the original "max" of d=1)
+//   d ∈ [0, 1] → spawn-position curriculum, barrier_prob fixed at 0.5,
+//                non-path cells empty. Ball spawns closer to goal at low d.
+//   d ∈ [1, 2] → spawn at original start. Non-path cells become obstacles:
+//                a hole is placed at the center of each non-BFS-path cell
+//                with probability (d - 1). At d=2, every off-path cell has
+//                a hole. The agent must follow the path strictly — anywhere
+//                else is deadly.
 static inline void labyrinth_load_curriculum_maze(Labyrinth* env, uint32_t seed, float difficulty) {
     if (difficulty < 0.0f) difficulty = 0.0f;
     if (difficulty > 2.0f) difficulty = 2.0f;
-    // Phase 2: bump barrier_prob above 0.5 once d > 1.
-    float barrier_prob = (difficulty > 1.0f) ? (0.5f + 0.5f * (difficulty - 1.0f)) : 0.5f;
-    labyrinth_generate_grid_maze(env, seed, 4, 5, barrier_prob, 0);
+    const int rows = 4, cols = 5;
+    labyrinth_generate_grid_maze(env, seed, rows, cols, 0.5f, 0);
+
+    // Phase 2: fill non-path cells with center-holes proportional to (d - 1).
+    if (difficulty > 1.0f) {
+        float fill_frac = difficulty - 1.0f;  // 0..1
+        float cw = BOARD_W / (float)cols;
+        float ch = BOARD_H / (float)rows;
+        // Mark cells that are on the BFS solution path (we want them empty).
+        char on_path[LAB_MAZE_MAX_DIM * LAB_MAZE_MAX_DIM];
+        memset(on_path, 0, sizeof(on_path));
+        for (int i = 0; i < env->num_path_points; i++) {
+            int c = (int)(env->path_points[i][0] / cw);
+            int r = (int)(env->path_points[i][1] / ch);
+            if (c >= 0 && c < cols && r >= 0 && r < rows)
+                on_path[r * cols + c] = 1;
+        }
+        uint32_t rng = (seed ^ 0xDEADBEEFu) | 1u;
+        uint32_t threshold = (uint32_t)(fill_frac * (float)0xFFFFFFFFu);
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                if (on_path[r * cols + c]) continue;
+                if (lab_rng_next(&rng) < threshold) {
+                    float cx = (c + 0.5f) * cw;
+                    float cy = (r + 0.5f) * ch;
+                    labyrinth_add_hole(env, cx, cy, DEMO_HOLE_RADIUS);
+                }
+            }
+        }
+    }
+
     // Phase 1: spawn-position curriculum. For d>=1, spawn at original start.
     float spawn_d = (difficulty < 1.0f) ? difficulty : 1.0f;
     if (env->num_path_points >= 2) {
