@@ -660,6 +660,43 @@ static inline void build_distance_field(LabyrinthEnv* env) {
             queue[qt++] = n;
         }
     }
+
+    // ---- Hole-proximity inflation ----
+    // Cells near holes get extra distance added so the BFS gradient routes
+    // around them with margin. The optimal BFS path follows the spanning-tree
+    // open adjacencies (never between flanking holes), so we can be aggressive:
+    // a cell at the hole rim costs +HOLE_INFLATE_PENALTY of equivalent BFS
+    // distance, falling linearly to zero at HOLE_INFLATE_MARGIN_M from the rim.
+    // Result: the agent strongly prefers wide corridors and only takes
+    // hole-flanked routes when no alternative exists.
+    const float HOLE_INFLATE_MARGIN_M = 3.0f * LABYRINTH_VIEW_CELL_M;  // 18mm
+    const int   HOLE_INFLATE_PENALTY  = 20;
+    if (env->phys.num_holes > 0) {
+        for (int idx = 0; idx < N; idx++) {
+            unsigned short d = env->dist_to_goal[idx];
+            if (d == INF) continue;
+            float cx = (idx % LABYRINTH_GRID_W + 0.5f) * LABYRINTH_VIEW_CELL_M;
+            float cy = (idx / LABYRINTH_GRID_W + 0.5f) * LABYRINTH_VIEW_CELL_M;
+            float min_slack = HOLE_INFLATE_MARGIN_M + 1.0f;  // sentinel
+            for (int h = 0; h < env->phys.num_holes; h++) {
+                const Hole* hole = &env->phys.holes[h];
+                float dx = cx - hole->cx;
+                float dy = cy - hole->cy;
+                float dist = sqrtf(dx * dx + dy * dy);
+                float slack = dist - hole->radius;
+                if (slack < min_slack) min_slack = slack;
+            }
+            if (min_slack < 0.0f) min_slack = 0.0f;
+            if (min_slack < HOLE_INFLATE_MARGIN_M) {
+                float t = 1.0f - (min_slack / HOLE_INFLATE_MARGIN_M);  // 1 at rim, 0 at edge
+                int penalty = (int)(HOLE_INFLATE_PENALTY * t + 0.5f);
+                int new_d = (int)d + penalty;
+                if (new_d > 0xFFFE) new_d = 0xFFFE;  // clamp below INF sentinel
+                env->dist_to_goal[idx] = (unsigned short)new_d;
+                if (new_d > max_d) max_d = new_d;
+            }
+        }
+    }
     env->max_dist = (max_d > 0) ? max_d : 1;
 }
 
