@@ -239,10 +239,9 @@ static inline void labyrinth_generate_grid_maze(Labyrinth* env, uint32_t seed, i
     }
     int start_row = start_idx / cols, start_col = start_idx % cols;
     int goal_row  = goal_idx  / cols, goal_col  = goal_idx  % cols;
-    // Goal radius fixed at 1.3× ball radius (same as hole radius) — forces
-    // the agent to actually park near the goal center rather than clipping
-    // the edge while still rolling along a wall.
-    float goal_radius_m = 1.3f * BALL_RADIUS;
+    // Goal radius bumped to 3× ball radius (~18mm disc, vs 1.3× = 7.8mm).
+    // Easier parking; lets the agent succeed from a wider arrival window.
+    float goal_radius_m = 3.0f * BALL_RADIUS;
     labyrinth_set_goal(env, (goal_col + 0.5f) * cw, (goal_row + 0.5f) * ch, goal_radius_m);
     labyrinth_place_ball(env, (start_col + 0.5f) * cw, (start_row + 0.5f) * ch);
 
