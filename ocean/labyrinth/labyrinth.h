@@ -375,13 +375,9 @@ static inline void draw_board(const Labyrinth* env) {
 
 // ===== RL env API =====
 
-// Action: 2 continuous dims in [-1, 1], interpreted as TARGET tilt_x, tilt_y
-// (scaled to ±MAX_TILT_RAD). The physical tilt slews toward the target at
-// LABYRINTH_TILT_RATE rad per c_step — prevents the agent from teleporting the
-// board to an arbitrary tilt in one step and forces human-plausible dynamics.
-// 0.02 rad ≈ 1.1° per 20ms step → ~400ms for a full −MAX_TILT_RAD to +MAX_TILT_RAD swing.
+// Action: 2 continuous dims in [-1, 1], interpreted as tilt_x, tilt_y
+// (scaled to ±MAX_TILT_RAD) and applied directly to the board each agent step.
 #define LABYRINTH_NUM_ACTION_DIMS 2
-#define LABYRINTH_TILT_RATE 0.02f
 
 // ---- Observation space: local vision + scalars ----
 // Board is rasterized into a coarse grid at reset(); each step the env copies
@@ -840,16 +836,9 @@ static inline void c_step(LabyrinthEnv* env) {
     if (ax >  1.0f) ax =  1.0f;
     if (ay < -1.0f) ay = -1.0f;
     if (ay >  1.0f) ay =  1.0f;
-    float target_tilt_x = ax * MAX_TILT_RAD;
-    float target_tilt_y = ay * MAX_TILT_RAD;
-    float dx = target_tilt_x - env->phys.tilt_x;
-    float dy = target_tilt_y - env->phys.tilt_y;
-    if (dx >  LABYRINTH_TILT_RATE) dx =  LABYRINTH_TILT_RATE;
-    if (dx < -LABYRINTH_TILT_RATE) dx = -LABYRINTH_TILT_RATE;
-    if (dy >  LABYRINTH_TILT_RATE) dy =  LABYRINTH_TILT_RATE;
-    if (dy < -LABYRINTH_TILT_RATE) dy = -LABYRINTH_TILT_RATE;
-    env->phys.tilt_x += dx;
-    env->phys.tilt_y += dy;
+    // Tilt rate limit removed — policy directly sets tilt each agent step.
+    env->phys.tilt_x = ax * MAX_TILT_RAD;
+    env->phys.tilt_y = ay * MAX_TILT_RAD;
 
     for (int i = 0; i < env->physics_substeps; i++) {
         labyrinth_step(&env->phys);
