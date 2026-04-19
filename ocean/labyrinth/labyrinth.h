@@ -403,8 +403,15 @@ static inline void draw_board(const Labyrinth* env) {
 // 8 scalar features alongside the egocentric raster view:
 //   [0..2] ball_v{x,y,z}        (scaled by 1/2)
 //   [3..4] tilt_{x,y}           (scaled by 1/MAX_TILT_RAD)
-//   [5..6] goal_offset_{x,y}    (ball→goal, board-fraction)
-//   [7]    bfs_dist_norm        (BFS distance at ball's cell / max_dist)
+//   [5..6] bfs_gradient_{x,y}   (unit vector toward the neighbor cell with
+//                                lowest BFS distance — the "GPS arrow" through
+//                                the maze. One of (-1,0)/(1,0)/(0,-1)/(0,1)/
+//                                (0,0). Zero at goal or unreachable.)
+//   [7]    bfs_dist_norm        (BFS distance at ball's cell / max_dist; tells
+//                                the agent when it's close to the goal)
+// NOTE: straight-line goal_offset_{x,y} was deliberately removed. It pointed
+// through walls/holes 30-50% of the time at d>0.5 and conflicted with the
+// BFS-gradient signal. Goal cell is still visible in the raster (code 3).
 #define LABYRINTH_SCALAR_FEATURES 8
 
 // Potential-based shaping (Ng 1999): F = γ·φ(s') − φ(s),
@@ -668,6 +675,42 @@ static inline float labyrinth_dist_norm_at(const LabyrinthEnv* env, int gx, int 
     return n;
 }
 
+// Unit vector pointing from the ball's cell toward the neighbor whose BFS
+// distance-to-goal is lowest. Returns one of (-1,0), (1,0), (0,-1), (0,1) or
+// (0,0) (at goal or unreachable). Distinct from the straight-line direction
+// because this respects walls/holes — it's the "next-best move" through the
+// maze topology.
+static inline void labyrinth_bfs_gradient(const LabyrinthEnv* env,
+        float* gx, float* gy) {
+    int bx = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
+    int by = (int)(env->phys.ball_y / LABYRINTH_VIEW_CELL_M);
+    if (bx < 0) bx = 0;
+    if (bx >= LABYRINTH_GRID_W) bx = LABYRINTH_GRID_W - 1;
+    if (by < 0) by = 0;
+    if (by >= LABYRINTH_GRID_H) by = LABYRINTH_GRID_H - 1;
+    unsigned short d_here = env->dist_to_goal[by * LABYRINTH_GRID_W + bx];
+    if (d_here == 0 || d_here == 0xFFFFu) {
+        *gx = 0.0f; *gy = 0.0f;
+        return;
+    }
+    const int dx_neigh[4] = {-1, +1,  0,  0};
+    const int dy_neigh[4] = { 0,  0, -1, +1};
+    int best_k = -1;
+    unsigned short best_d = d_here;
+    for (int k = 0; k < 4; k++) {
+        int nx = bx + dx_neigh[k];
+        int ny = by + dy_neigh[k];
+        if (nx < 0 || nx >= LABYRINTH_GRID_W || ny < 0 || ny >= LABYRINTH_GRID_H)
+            continue;
+        unsigned short d = env->dist_to_goal[ny * LABYRINTH_GRID_W + nx];
+        if (d == 0xFFFFu) continue;
+        if (d < best_d) { best_d = d; best_k = k; }
+    }
+    if (best_k < 0) { *gx = 0.0f; *gy = 0.0f; return; }
+    *gx = (float)dx_neigh[best_k];
+    *gy = (float)dy_neigh[best_k];
+}
+
 // Same, but for the ball's current cell. Off-board ball clamps in-grid.
 static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
     int gx = (int)(env->phys.ball_x / LABYRINTH_VIEW_CELL_M);
@@ -704,15 +747,15 @@ static inline void compute_observations(LabyrinthEnv* env) {
     // ---- 8 scalar features ----
     const float inv_vmax = 1.0f / 2.0f;
     const float inv_t = 1.0f / MAX_TILT_RAD;
-    const float inv_w = 1.0f / BOARD_W;
-    const float inv_h = 1.0f / BOARD_H;
     obs[k++] = p->ball_vx * inv_vmax;
     obs[k++] = p->ball_vy * inv_vmax;
     obs[k++] = p->ball_vz * inv_vmax;
     obs[k++] = p->tilt_x * inv_t;
     obs[k++] = p->tilt_y * inv_t;
-    obs[k++] = (p->goal_cx - p->ball_x) * inv_w;
-    obs[k++] = (p->goal_cy - p->ball_y) * inv_h;
+    float gx, gy;
+    labyrinth_bfs_gradient(env, &gx, &gy);
+    obs[k++] = gx;
+    obs[k++] = gy;
     obs[k++] = labyrinth_dist_to_goal_norm(env);
 }
 
