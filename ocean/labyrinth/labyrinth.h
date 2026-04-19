@@ -516,7 +516,11 @@ static inline void init(LabyrinthEnv* env) {
         env->physics_substeps = LABYRINTH_PHYSICS_SUBSTEPS;
     if (env->seed == 0)
         env->seed = 12345u;
-    env->maze_seed = env->seed;
+    // Mix in env->rng (set per-env to its index by vecenv) so each env sees
+    // a different sequence of mazes from step 1. Without this, all envs share
+    // the same finite pool of seeds and the policy memorizes them — eval on
+    // unseen seeds drops dramatically (87% train vs 49% eval, before the fix).
+    env->maze_seed = env->seed + env->rng;
     env->episode_return = 0.0f;
     env->client = NULL;
     if (env->difficulty_start < 0.0f || env->difficulty_start > 1.0f)
