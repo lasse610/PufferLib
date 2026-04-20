@@ -892,6 +892,123 @@ static void test_obs_on_procedural_maze(void) {
     EXPECT(in_range == total && total > 0, "procedural mazes all in [-1,1]", msg);
 }
 
+// ---- minimal-obs helper tests ----
+
+static void test_next_path_idx_start_of_path(void) {
+    printf("labyrinth_next_path_idx: ball near start → idx 1\n");
+    Labyrinth env = {0};
+    float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 4);
+    // Ball near the start point (path_points[0]).
+    int idx = labyrinth_next_path_idx(&env, 0.01f, 0.10f);
+    EXPECT(idx == 1, "start → next=1", "wrong next idx");
+}
+
+static void test_next_path_idx_mid_segment(void) {
+    printf("labyrinth_next_path_idx: ball mid-segment → idx of segment end\n");
+    Labyrinth env = {0};
+    float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 4);
+    // Ball in the middle of segment 0 (0,0.1)→(0.1,0.1).
+    int idx = labyrinth_next_path_idx(&env, 0.05f, 0.10f);
+    EXPECT(idx == 1, "mid-seg-0 → next=1", "wrong next idx");
+    // Ball in the middle of segment 1 (0.1,0.1)→(0.1,0.2).
+    idx = labyrinth_next_path_idx(&env, 0.10f, 0.15f);
+    EXPECT(idx == 2, "mid-seg-1 → next=2", "wrong next idx");
+    // Ball in the middle of segment 2 (0.1,0.2)→(0.2,0.2).
+    idx = labyrinth_next_path_idx(&env, 0.15f, 0.20f);
+    EXPECT(idx == 3, "mid-seg-2 → next=3", "wrong next idx");
+}
+
+static void test_next_path_idx_at_last_waypoint(void) {
+    printf("labyrinth_next_path_idx: ball at last waypoint → idx clamped to last\n");
+    Labyrinth env = {0};
+    float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 4);
+    int idx = labyrinth_next_path_idx(&env, 0.20f, 0.20f);
+    EXPECT(idx == 3, "at last waypoint → idx=3 (clamped)", "wrong");
+}
+
+static void test_next_path_idx_degenerate(void) {
+    printf("labyrinth_next_path_idx: empty/single-point path → idx 0\n");
+    Labyrinth env = {0};
+    labyrinth_reset(&env);
+    env.num_path_points = 0;
+    EXPECT(labyrinth_next_path_idx(&env, 0.5f, 0.5f) == 0, "0-point: idx=0", "wrong");
+    env.num_path_points = 1;
+    env.path_points[0][0] = 0.1f; env.path_points[0][1] = 0.1f;
+    EXPECT(labyrinth_next_path_idx(&env, 0.5f, 0.5f) == 0, "1-point: idx=0", "wrong");
+}
+
+// Integration test: reproduce the 10-dim obs on a known geometry.
+static void test_minimal_obs_known_geometry(void) {
+    printf("minimal obs: 10 scalars on known path\n");
+    Labyrinth env = {0};
+    // Path: start (0,0.1) → corner (0.1,0.1) → corner (0.1,0.2) → goal (0.2,0.2)
+    float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 4);
+    env.ball_x = 0.05f; env.ball_y = 0.10f;  // mid-segment 0
+    env.ball_vx = 0.4f; env.ball_vy = -0.2f;
+    env.tilt_x = 0.5f * MAX_TILT_RAD;
+    env.tilt_y = -0.25f * MAX_TILT_RAD;
+    env.goal_cx = 0.20f; env.goal_cy = 0.20f;
+
+    // Replicate compute_observations logic.
+    float obs[10];
+    const float inv_vmax = 1.0f / 2.0f;
+    const float inv_t = 1.0f / MAX_TILT_RAD;
+    const float inv_w = 1.0f / BOARD_W;
+    const float inv_h = 1.0f / BOARD_H;
+    obs[0] = env.ball_vx * inv_vmax;
+    obs[1] = env.ball_vy * inv_vmax;
+    obs[2] = env.tilt_x * inv_t;
+    obs[3] = env.tilt_y * inv_t;
+    int next_idx = labyrinth_next_path_idx(&env, env.ball_x, env.ball_y);
+    int after_idx = next_idx + 1;
+    if (after_idx >= env.num_path_points) after_idx = env.num_path_points - 1;
+    obs[4] = (env.path_points[next_idx][0]  - env.ball_x) * inv_w;
+    obs[5] = (env.path_points[next_idx][1]  - env.ball_y) * inv_h;
+    obs[6] = (env.path_points[after_idx][0] - env.ball_x) * inv_w;
+    obs[7] = (env.path_points[after_idx][1] - env.ball_y) * inv_h;
+    obs[8] = (env.goal_cx - env.ball_x) * inv_w;
+    obs[9] = (env.goal_cy - env.ball_y) * inv_h;
+
+    EXPECT_NEAR(obs[0], 0.2f, 1e-6f, "obs[0] = vx/2");
+    EXPECT_NEAR(obs[1], -0.1f, 1e-6f, "obs[1] = vy/2");
+    EXPECT_NEAR(obs[2], 0.5f, 1e-6f, "obs[2] = tilt_x/MAX");
+    EXPECT_NEAR(obs[3], -0.25f, 1e-6f, "obs[3] = tilt_y/MAX");
+    // next waypoint = path_points[1] = (0.1, 0.1). offset from (0.05, 0.10) = (0.05, 0).
+    EXPECT_NEAR(obs[4], 0.05f / BOARD_W, 1e-6f, "obs[4] next.dx");
+    EXPECT_NEAR(obs[5], 0.00f / BOARD_H, 1e-6f, "obs[5] next.dy");
+    // after waypoint = path_points[2] = (0.1, 0.2). offset = (0.05, 0.10).
+    EXPECT_NEAR(obs[6], 0.05f / BOARD_W, 1e-6f, "obs[6] after.dx");
+    EXPECT_NEAR(obs[7], 0.10f / BOARD_H, 1e-6f, "obs[7] after.dy");
+    // goal = (0.20, 0.20). offset = (0.15, 0.10).
+    EXPECT_NEAR(obs[8], 0.15f / BOARD_W, 1e-6f, "obs[8] goal.dx");
+    EXPECT_NEAR(obs[9], 0.10f / BOARD_H, 1e-6f, "obs[9] goal.dy");
+
+    int all_in_range = 1;
+    for (int i = 0; i < 10; i++) {
+        if (obs[i] < -1.5f || obs[i] > 1.5f) { all_in_range = 0; break; }
+    }
+    EXPECT(all_in_range, "all 10 obs in [-1.5, 1.5]", "out of range");
+}
+
+static void test_minimal_obs_advances_with_ball(void) {
+    printf("minimal obs: next-waypoint advances as ball crosses segments\n");
+    Labyrinth env = {0};
+    float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
+    make_env_with_path(&env, pts, 4);
+    // At start: next=1
+    EXPECT(labyrinth_next_path_idx(&env, 0.01f, 0.10f) == 1, "start: next=1", "");
+    // Just past segment 0: next=2
+    EXPECT(labyrinth_next_path_idx(&env, 0.10f, 0.12f) == 2, "past seg0: next=2", "");
+    // Just past segment 1: next=3
+    EXPECT(labyrinth_next_path_idx(&env, 0.12f, 0.20f) == 3, "past seg1: next=3", "");
+    // At goal: still clamped to 3
+    EXPECT(labyrinth_next_path_idx(&env, 0.20f, 0.20f) == 3, "at goal: next=3", "");
+}
+
 int main(void) {
     printf("labyrinth physics tests\n");
     printf("=======================\n");
@@ -929,6 +1046,12 @@ int main(void) {
     test_nearest_hole_picks_closest();
     test_full_obs_known_geometry();
     test_obs_on_procedural_maze();
+    test_next_path_idx_start_of_path();
+    test_next_path_idx_mid_segment();
+    test_next_path_idx_at_last_waypoint();
+    test_next_path_idx_degenerate();
+    test_minimal_obs_known_geometry();
+    test_minimal_obs_advances_with_ball();
     printf("\n%d / %d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed == 0 ? 0 : 1;
 }

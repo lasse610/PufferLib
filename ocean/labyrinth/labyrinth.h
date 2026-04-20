@@ -408,7 +408,18 @@ static inline void draw_board(const Labyrinth* env) {
 // NOTE: straight-line goal_offset_{x,y} was deliberately removed. It pointed
 // through walls/holes 30-50% of the time at d>0.5 and conflicted with the
 // BFS-gradient signal. Goal cell is still visible in the raster (code 3).
-#define LABYRINTH_SCALAR_FEATURES 8
+//
+// ============================================================================
+// minimalobs branch: OBS COMPLETELY REPLACED with 10 continuous scalars.
+// No raster, no BFS grid, no cell-quantized signals. Path-following only.
+//
+//   [0..1] ball_v{x,y}                 (m/s, scaled by 1/2)
+//   [2..3] tilt_{x,y}                  (scaled by 1/MAX_TILT_RAD)
+//   [4..5] next path waypoint offset   (board-fraction from ball)
+//   [6..7] waypoint-after-next offset  (board-fraction, lookahead)
+//   [8..9] goal offset                 (board-fraction from ball)
+// ============================================================================
+#define LABYRINTH_SCALAR_FEATURES 10
 
 // Potential-based shaping (Ng 1999): F = γ·φ(s') − φ(s),
 // with φ(s) = k · (1 − bfs_dist_norm) and φ(terminal) ≡ 0. Discounted
@@ -422,7 +433,8 @@ static inline void draw_board(const Labyrinth* env) {
 // stall-to-timeout is worse than falling.
 #define LABYRINTH_STEP_PENALTY 0.002f
 
-#define LABYRINTH_OBS_SIZE (LABYRINTH_VIEW_SIZE + LABYRINTH_SCALAR_FEATURES)
+// minimalobs: drop the raster; obs is scalars only.
+#define LABYRINTH_OBS_SIZE LABYRINTH_SCALAR_FEATURES
 
 #define LABYRINTH_MAX_STEPS 2000
 
@@ -758,38 +770,38 @@ static inline float labyrinth_dist_to_goal_norm(const LabyrinthEnv* env) {
 static inline void compute_observations(LabyrinthEnv* env) {
     const Labyrinth* p = &env->phys;
     float* obs = env->observations;
-
-    // ---- 15×15 egocentric raster around the ball ----
-    int bgx = (int)(p->ball_x / LABYRINTH_VIEW_CELL_M);
-    int bgy = (int)(p->ball_y / LABYRINTH_VIEW_CELL_M);
-    int k = 0;
-    for (int dy = -LABYRINTH_VISION; dy <= LABYRINTH_VISION; dy++) {
-        for (int dx = -LABYRINTH_VISION; dx <= LABYRINTH_VISION; dx++) {
-            int gx = bgx + dx;
-            int gy = bgy + dy;
-            unsigned char cell;
-            if (gx < 0 || gx >= LABYRINTH_GRID_W || gy < 0 || gy >= LABYRINTH_GRID_H) {
-                cell = LABYRINTH_CELL_WALL;  // off-grid reads as wall
-            } else {
-                cell = env->grid[gy * LABYRINTH_GRID_W + gx];
-            }
-            obs[k++] = (float)cell;
-        }
-    }
-
-    // ---- 8 scalar features ----
     const float inv_vmax = 1.0f / 2.0f;
     const float inv_t = 1.0f / MAX_TILT_RAD;
-    obs[k++] = p->ball_vx * inv_vmax;
-    obs[k++] = p->ball_vy * inv_vmax;
-    obs[k++] = p->ball_vz * inv_vmax;
-    obs[k++] = p->tilt_x * inv_t;
-    obs[k++] = p->tilt_y * inv_t;
-    float gx, gy;
-    labyrinth_bfs_gradient(env, &gx, &gy);
-    obs[k++] = gx;
-    obs[k++] = gy;
-    obs[k++] = labyrinth_dist_to_goal_norm(env);
+    const float inv_w = 1.0f / BOARD_W;
+    const float inv_h = 1.0f / BOARD_H;
+
+    // [0..1] velocity
+    obs[0] = p->ball_vx * inv_vmax;
+    obs[1] = p->ball_vy * inv_vmax;
+    // [2..3] tilt
+    obs[2] = p->tilt_x * inv_t;
+    obs[3] = p->tilt_y * inv_t;
+
+    // [4..5] vector to NEXT path waypoint (board-fraction)
+    // [6..7] vector to WAYPOINT-AFTER-NEXT (board-fraction)
+    int next_idx = labyrinth_next_path_idx(p, p->ball_x, p->ball_y);
+    int after_idx = next_idx + 1;
+    if (after_idx >= p->num_path_points) after_idx = p->num_path_points - 1;
+
+    if (p->num_path_points >= 2) {
+        obs[4] = (p->path_points[next_idx][0]  - p->ball_x) * inv_w;
+        obs[5] = (p->path_points[next_idx][1]  - p->ball_y) * inv_h;
+        obs[6] = (p->path_points[after_idx][0] - p->ball_x) * inv_w;
+        obs[7] = (p->path_points[after_idx][1] - p->ball_y) * inv_h;
+    } else {
+        // Degenerate: no path. Point straight at the goal.
+        obs[4] = obs[6] = (p->goal_cx - p->ball_x) * inv_w;
+        obs[5] = obs[7] = (p->goal_cy - p->ball_y) * inv_h;
+    }
+
+    // [8..9] vector to GOAL (board-fraction). Shrinks to 0 as ball parks.
+    obs[8] = (p->goal_cx - p->ball_x) * inv_w;
+    obs[9] = (p->goal_cy - p->ball_y) * inv_h;
 }
 
 // Curriculum max raised to 2.0:

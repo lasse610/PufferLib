@@ -385,6 +385,21 @@ static inline void labyrinth_path_tangent(const Labyrinth* env, int seg,
     *tx = dx / n; *ty = dy / n;
 }
 
+// Index of the "next" path waypoint ahead of the ball. Defined as the end
+// index of the segment the ball is currently closest to. As the ball moves
+// along a segment the next-waypoint is stable; it advances by one when the
+// ball crosses into the following segment. Clamped to last valid index.
+// Returns 0 for degenerate (0- or 1-point) paths.
+static inline int labyrinth_next_path_idx(const Labyrinth* env,
+        float ball_x, float ball_y) {
+    if (env->num_path_points < 2) return 0;
+    float ppx, ppy; int seg; float t_seg;
+    labyrinth_nearest_path_point(env, ball_x, ball_y, &ppx, &ppy, &seg, &t_seg);
+    int idx = seg + 1;
+    if (idx >= env->num_path_points) idx = env->num_path_points - 1;
+    return idx;
+}
+
 // Nearest hole to (px, py). Sets dx/dy as offset (hole_center - ball) and dist
 // as the euclidean distance. With no holes, returns dx=dy=0, dist=board_diag.
 static inline void labyrinth_nearest_hole(const Labyrinth* env, float px, float py,
