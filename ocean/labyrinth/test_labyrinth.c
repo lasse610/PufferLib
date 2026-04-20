@@ -940,9 +940,9 @@ static void test_next_path_idx_degenerate(void) {
     EXPECT(labyrinth_next_path_idx(&env, 0.5f, 0.5f) == 0, "1-point: idx=0", "wrong");
 }
 
-// Integration test: reproduce the 10-dim obs on a known geometry.
+// Integration test: reproduce the 14-dim obs on a known geometry.
 static void test_minimal_obs_known_geometry(void) {
-    printf("minimal obs: 10 scalars on known path\n");
+    printf("minimal obs: 14 scalars on known path\n");
     Labyrinth env = {0};
     // Path: start (0,0.1) → corner (0.1,0.1) → corner (0.1,0.2) → goal (0.2,0.2)
     float pts[4][2] = {{0.00f, 0.10f}, {0.10f, 0.10f}, {0.10f, 0.20f}, {0.20f, 0.20f}};
@@ -954,7 +954,7 @@ static void test_minimal_obs_known_geometry(void) {
     env.goal_cx = 0.20f; env.goal_cy = 0.20f;
 
     // Replicate compute_observations logic.
-    float obs[10];
+    float obs[14];
     const float inv_vmax = 1.0f / 2.0f;
     const float inv_t = 1.0f / MAX_TILT_RAD;
     const float inv_w = 1.0f / BOARD_W;
@@ -963,35 +963,38 @@ static void test_minimal_obs_known_geometry(void) {
     obs[1] = env.ball_vy * inv_vmax;
     obs[2] = env.tilt_x * inv_t;
     obs[3] = env.tilt_y * inv_t;
-    int next_idx = labyrinth_next_path_idx(&env, env.ball_x, env.ball_y);
-    int after_idx = next_idx + 1;
-    if (after_idx >= env.num_path_points) after_idx = env.num_path_points - 1;
-    obs[4] = (env.path_points[next_idx][0]  - env.ball_x) * inv_w;
-    obs[5] = (env.path_points[next_idx][1]  - env.ball_y) * inv_h;
-    obs[6] = (env.path_points[after_idx][0] - env.ball_x) * inv_w;
-    obs[7] = (env.path_points[after_idx][1] - env.ball_y) * inv_h;
-    obs[8] = (env.goal_cx - env.ball_x) * inv_w;
-    obs[9] = (env.goal_cy - env.ball_y) * inv_h;
+    int base_idx = labyrinth_next_path_idx(&env, env.ball_x, env.ball_y);
+    int k = 4;
+    for (int i = 0; i < 4; i++) {
+        int idx = base_idx + i;
+        if (idx >= env.num_path_points) idx = env.num_path_points - 1;
+        obs[k++] = (env.path_points[idx][0] - env.ball_x) * inv_w;
+        obs[k++] = (env.path_points[idx][1] - env.ball_y) * inv_h;
+    }
+    obs[12] = (env.goal_cx - env.ball_x) * inv_w;
+    obs[13] = (env.goal_cy - env.ball_y) * inv_h;
 
     EXPECT_NEAR(obs[0], 0.2f, 1e-6f, "obs[0] = vx/2");
     EXPECT_NEAR(obs[1], -0.1f, 1e-6f, "obs[1] = vy/2");
     EXPECT_NEAR(obs[2], 0.5f, 1e-6f, "obs[2] = tilt_x/MAX");
     EXPECT_NEAR(obs[3], -0.25f, 1e-6f, "obs[3] = tilt_y/MAX");
-    // next waypoint = path_points[1] = (0.1, 0.1). offset from (0.05, 0.10) = (0.05, 0).
-    EXPECT_NEAR(obs[4], 0.05f / BOARD_W, 1e-6f, "obs[4] next.dx");
-    EXPECT_NEAR(obs[5], 0.00f / BOARD_H, 1e-6f, "obs[5] next.dy");
-    // after waypoint = path_points[2] = (0.1, 0.2). offset = (0.05, 0.10).
-    EXPECT_NEAR(obs[6], 0.05f / BOARD_W, 1e-6f, "obs[6] after.dx");
-    EXPECT_NEAR(obs[7], 0.10f / BOARD_H, 1e-6f, "obs[7] after.dy");
-    // goal = (0.20, 0.20). offset = (0.15, 0.10).
-    EXPECT_NEAR(obs[8], 0.15f / BOARD_W, 1e-6f, "obs[8] goal.dx");
-    EXPECT_NEAR(obs[9], 0.10f / BOARD_H, 1e-6f, "obs[9] goal.dy");
+    // base_idx=1 (mid seg 0 → next=1). 4 waypoints: [1]=(.1,.1), [2]=(.1,.2), [3]=(.2,.2), [3]=(.2,.2) clamp
+    EXPECT_NEAR(obs[4],  0.05f / BOARD_W, 1e-6f, "obs[4] +0.dx");
+    EXPECT_NEAR(obs[5],  0.00f / BOARD_H, 1e-6f, "obs[5] +0.dy");
+    EXPECT_NEAR(obs[6],  0.05f / BOARD_W, 1e-6f, "obs[6] +1.dx");
+    EXPECT_NEAR(obs[7],  0.10f / BOARD_H, 1e-6f, "obs[7] +1.dy");
+    EXPECT_NEAR(obs[8],  0.15f / BOARD_W, 1e-6f, "obs[8] +2.dx");
+    EXPECT_NEAR(obs[9],  0.10f / BOARD_H, 1e-6f, "obs[9] +2.dy");
+    EXPECT_NEAR(obs[10], 0.15f / BOARD_W, 1e-6f, "obs[10] +3 (clamp).dx");
+    EXPECT_NEAR(obs[11], 0.10f / BOARD_H, 1e-6f, "obs[11] +3 (clamp).dy");
+    EXPECT_NEAR(obs[12], 0.15f / BOARD_W, 1e-6f, "obs[12] goal.dx");
+    EXPECT_NEAR(obs[13], 0.10f / BOARD_H, 1e-6f, "obs[13] goal.dy");
 
     int all_in_range = 1;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 14; i++) {
         if (obs[i] < -1.5f || obs[i] > 1.5f) { all_in_range = 0; break; }
     }
-    EXPECT(all_in_range, "all 10 obs in [-1.5, 1.5]", "out of range");
+    EXPECT(all_in_range, "all 14 obs in [-1.5, 1.5]", "out of range");
 }
 
 static void test_minimal_obs_advances_with_ball(void) {

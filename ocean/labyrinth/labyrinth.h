@@ -410,16 +410,20 @@ static inline void draw_board(const Labyrinth* env) {
 // BFS-gradient signal. Goal cell is still visible in the raster (code 3).
 //
 // ============================================================================
-// minimalobs branch: OBS COMPLETELY REPLACED with 10 continuous scalars.
+// minimalobs branch: OBS COMPLETELY REPLACED with 14 continuous scalars.
 // No raster, no BFS grid, no cell-quantized signals. Path-following only.
+// Waypoints are every cell on the BFS path (spaced ~cell-width apart), so
+// a 4-deep lookahead covers ~24cm (≈ half the board) of upcoming trajectory.
 //
-//   [0..1] ball_v{x,y}                 (m/s, scaled by 1/2)
-//   [2..3] tilt_{x,y}                  (scaled by 1/MAX_TILT_RAD)
-//   [4..5] next path waypoint offset   (board-fraction from ball)
-//   [6..7] waypoint-after-next offset  (board-fraction, lookahead)
-//   [8..9] goal offset                 (board-fraction from ball)
+//   [0..1]   ball_v{x,y}                 (m/s, scaled by 1/2)
+//   [2..3]   tilt_{x,y}                  (scaled by 1/MAX_TILT_RAD)
+//   [4..5]   next path waypoint offset   (board-fraction from ball)
+//   [6..7]   +1 waypoint offset          (lookahead)
+//   [8..9]   +2 waypoint offset          (deeper lookahead)
+//   [10..11] +3 waypoint offset          (deepest lookahead)
+//   [12..13] goal offset                 (board-fraction from ball)
 // ============================================================================
-#define LABYRINTH_SCALAR_FEATURES 10
+#define LABYRINTH_SCALAR_FEATURES 14
 
 // Potential-based shaping (Ng 1999): F = γ·φ(s') − φ(s),
 // with φ(s) = k · (1 − bfs_dist_norm) and φ(terminal) ≡ 0. Discounted
@@ -782,26 +786,26 @@ static inline void compute_observations(LabyrinthEnv* env) {
     obs[2] = p->tilt_x * inv_t;
     obs[3] = p->tilt_y * inv_t;
 
-    // [4..5] vector to NEXT path waypoint (board-fraction)
-    // [6..7] vector to WAYPOINT-AFTER-NEXT (board-fraction)
-    int next_idx = labyrinth_next_path_idx(p, p->ball_x, p->ball_y);
-    int after_idx = next_idx + 1;
-    if (after_idx >= p->num_path_points) after_idx = p->num_path_points - 1;
-
-    if (p->num_path_points >= 2) {
-        obs[4] = (p->path_points[next_idx][0]  - p->ball_x) * inv_w;
-        obs[5] = (p->path_points[next_idx][1]  - p->ball_y) * inv_h;
-        obs[6] = (p->path_points[after_idx][0] - p->ball_x) * inv_w;
-        obs[7] = (p->path_points[after_idx][1] - p->ball_y) * inv_h;
-    } else {
-        // Degenerate: no path. Point straight at the goal.
-        obs[4] = obs[6] = (p->goal_cx - p->ball_x) * inv_w;
-        obs[5] = obs[7] = (p->goal_cy - p->ball_y) * inv_h;
+    // [4..11] four waypoint offsets: next, +1, +2, +3 (board-fraction)
+    int base_idx = labyrinth_next_path_idx(p, p->ball_x, p->ball_y);
+    int k = 4;
+    for (int i = 0; i < 4; i++) {
+        int idx = base_idx + i;
+        if (p->num_path_points < 2 || idx >= p->num_path_points)
+            idx = (p->num_path_points >= 1) ? p->num_path_points - 1 : 0;
+        if (p->num_path_points >= 1) {
+            obs[k++] = (p->path_points[idx][0] - p->ball_x) * inv_w;
+            obs[k++] = (p->path_points[idx][1] - p->ball_y) * inv_h;
+        } else {
+            // Degenerate: point at goal.
+            obs[k++] = (p->goal_cx - p->ball_x) * inv_w;
+            obs[k++] = (p->goal_cy - p->ball_y) * inv_h;
+        }
     }
 
-    // [8..9] vector to GOAL (board-fraction). Shrinks to 0 as ball parks.
-    obs[8] = (p->goal_cx - p->ball_x) * inv_w;
-    obs[9] = (p->goal_cy - p->ball_y) * inv_h;
+    // [12..13] vector to GOAL (board-fraction). Shrinks to 0 as ball parks.
+    obs[12] = (p->goal_cx - p->ball_x) * inv_w;
+    obs[13] = (p->goal_cy - p->ball_y) * inv_h;
 }
 
 // Curriculum max raised to 2.0:
@@ -836,7 +840,7 @@ static inline void labyrinth_curriculum_record(LabyrinthEnv* env, int solved) {
 static inline void c_reset(LabyrinthEnv* env) {
     env->tick = 0;
     env->episode_return = 0.0f;
-    env->maze_seed += 1u;
+    env->maze_seed += 97u;  // large prime → adjacent episodes see uncorrelated mazes
     labyrinth_reset(&env->phys);
     labyrinth_load_curriculum_maze(&env->phys, env->maze_seed, env->current_difficulty);
     build_grid(env);
