@@ -437,6 +437,12 @@ static inline void draw_board(const Labyrinth* env) {
 // stall-to-timeout is worse than falling.
 #define LABYRINTH_STEP_PENALTY 0.002f
 
+// Time bonus awarded on SUCCESSFUL terminal: LABYRINTH_TIME_BONUS × steps_saved.
+// At max_steps=2000 with a 50-step solve, bonus = 0.002 × 1950 = 3.9 — noticeably
+// larger than the +1 terminal, so the policy is strongly pulled toward fast solves
+// (saving 50 steps = +0.1 reward). Only paid on success → no "fall fast" incentive.
+#define LABYRINTH_TIME_BONUS 0.002f
+
 // minimalobs: drop the raster; obs is scalars only.
 #define LABYRINTH_OBS_SIZE LABYRINTH_SCALAR_FEATURES
 
@@ -880,8 +886,15 @@ static inline void c_step(LabyrinthEnv* env) {
     env->prev_dist_norm = cur_dist_norm;
 
     float r = shaping - LABYRINTH_STEP_PENALTY;
-    if (env->phys.reached_goal)
+    if (env->phys.reached_goal) {
         r += 1.0f;
+        // Time bonus: reward agent for finishing fast. Every step saved below
+        // max_steps pays out LABYRINTH_TIME_BONUS. At 1B train steps with
+        // ep_len ~50, bonus ≈ 0.01 × (2000 - 50) = ~20 — dwarfs the +1
+        // terminal, strongly incentivizing fast solves. Only awarded on
+        // success so it doesn't encourage "fall fast" policies.
+        r += LABYRINTH_TIME_BONUS * (float)(env->max_steps - env->tick);
+    }
     else if (env->phys.fell_in_hole)
         r += -1.0f;
     env->rewards[0] = r;
