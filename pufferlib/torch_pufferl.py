@@ -7,6 +7,7 @@ import glob
 import time
 import ctypes
 from collections import defaultdict
+from copy import deepcopy
 
 import numpy as np
 
@@ -113,6 +114,101 @@ def _cpu_tensor(ptr, shape, dtype):
     arr = (ctype * n).from_address(ptr)
     return torch.frombuffer(arr, dtype=dtype).reshape(shape)
 
+def _load_native_raw_float_weights(policy, path, device):
+    state = policy.state_dict()
+    required = (
+        "encoder.encoder.weight",
+        "encoder.encoder.bias",
+        "decoder.decoder_mean.weight",
+        "decoder.decoder_mean.bias",
+        "decoder.value_function.weight",
+        "decoder.value_function.bias",
+        "decoder.decoder_logstd",
+    )
+    missing = [key for key in required if key not in state]
+    if missing:
+        raise ValueError(f"Raw native weight loading requires default continuous MLP keys; missing {missing}")
+
+    hidden_size = state["encoder.encoder.weight"].shape[0]
+    action_size = state["decoder.decoder_mean.weight"].shape[0]
+    mlp_layers = [
+        module for module in policy.network.net
+        if isinstance(module, torch.nn.Linear)
+    ]
+    expected = (
+        state["encoder.encoder.weight"].numel()
+        + state["encoder.encoder.bias"].numel()
+        + (action_size + 1) * hidden_size
+        + (action_size + 1)
+        + action_size
+        + sum(layer.weight.numel() + layer.bias.numel() for layer in mlp_layers)
+    )
+    raw = np.fromfile(path, dtype=np.float32)
+    if raw.size != expected:
+        raise ValueError(f"Raw native weight size mismatch: expected {expected} floats, got {raw.size}")
+
+    offset = 0
+
+    def take(shape):
+        nonlocal offset
+        count = int(np.prod(shape))
+        start = offset
+        end = start + count
+        value = np.zeros(count, dtype=np.float32)
+        if start < raw.size:
+            available = min(count, raw.size - start)
+            value[:available] = raw[start:start + available]
+        offset = (end + 7) & ~7
+        value = value.reshape(tuple(shape)).copy()
+        return torch.as_tensor(value, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        policy.encoder.encoder.weight.copy_(take(state["encoder.encoder.weight"].shape))
+        policy.encoder.encoder.bias.copy_(take(state["encoder.encoder.bias"].shape))
+
+        fused_weight = take((action_size + 1, hidden_size))
+        fused_bias = take((action_size + 1,))
+        policy.decoder.decoder_mean.weight.copy_(fused_weight[:action_size])
+        policy.decoder.value_function.weight.copy_(fused_weight[action_size:action_size + 1])
+        policy.decoder.decoder_mean.bias.copy_(fused_bias[:action_size])
+        policy.decoder.value_function.bias.copy_(fused_bias[action_size:action_size + 1])
+        policy.decoder.decoder_logstd.copy_(take(state["decoder.decoder_logstd"].shape))
+
+        for layer in mlp_layers:
+            layer.weight.copy_(take(layer.weight.shape))
+            layer.bias.copy_(take(layer.bias.shape))
+
+    if offset < raw.size:
+        raise ValueError(f"Raw native weight loader consumed {offset} floats, file has {raw.size}")
+
+class ValueNet(torch.nn.Module):
+    def __init__(self, obs_size, args):
+        super().__init__()
+        import pufferlib.models
+
+        policy_kwargs = args['policy']
+        hidden_size = policy_kwargs['hidden_size']
+        encoder_cls = getattr(pufferlib.models, args['torch']['encoder'])
+        network_cls = getattr(pufferlib.models, args['torch']['network'])
+
+        self.encoder = encoder_cls(obs_size, hidden_size)
+        self.network = network_cls(**policy_kwargs)
+        self.value = torch.nn.Linear(hidden_size, 1)
+
+    def initial_state(self, batch_size, device):
+        return self.network.initial_state(batch_size, device)
+
+    def forward_eval(self, x, state):
+        h = self.encoder(x)
+        h, state = self.network.forward_eval(h, state)
+        return self.value(h).squeeze(-1), state
+
+    def forward(self, x):
+        batch, horizon = x.shape[:2]
+        h = self.encoder(x.reshape(batch * horizon, *x.shape[2:]))
+        h = self.network.forward_train(h.reshape(batch, horizon, -1))
+        return self.value(h.reshape(batch * horizon, -1)).reshape(batch, horizon)
+
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
@@ -157,14 +253,55 @@ class PuffeRL:
         self.terminals = torch.zeros(horizon, total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
+        self.critic = None
+        self.critic_vec = None
+        self.critic_state = ()
+        self.critic_vec_obs = None
+        self.critic_observations = None
+
+        if config.get('asymmetric_critic', 0):
+            critic_args = deepcopy(args)
+            critic_env = critic_args['env']
+            critic_env['route_direct_obs'] = int(config.get(
+                'asymmetric_critic_route_direct_obs', 0))
+            critic_env['route_privileged_obs'] = int(config.get(
+                'asymmetric_critic_route_privileged_obs', 1))
+            critic_vec = _C.create_vec(critic_args, _C.gpu)
+            if critic_vec.total_agents != total_agents:
+                raise RuntimeError(
+                    f'critic total_agents {critic_vec.total_agents} != actor {total_agents}')
+            if critic_vec.obs_size != vec.obs_size:
+                raise RuntimeError(
+                    f'critic obs_size {critic_vec.obs_size} != actor {vec.obs_size}')
+            if critic_vec.act_sizes != vec.act_sizes:
+                raise RuntimeError(
+                    f'critic act_sizes {critic_vec.act_sizes} != actor {vec.act_sizes}')
+
+            critic_vec.reset()
+            self.critic_vec = critic_vec
+            if self.gpu:
+                self.critic_vec_obs = torch.as_tensor(_CudaPtr(
+                    critic_vec.gpu_obs_ptr, (total_agents, critic_vec.obs_size), obs_dtype))
+            else:
+                self.critic_vec_obs = _cpu_tensor(
+                    critic_vec.obs_ptr, (total_agents, critic_vec.obs_size), obs_dtype)
+
+            self.critic = ValueNet(critic_vec.obs_size, args).to(device)
+            self.critic_state = self.critic.initial_state(total_agents, device=device)
+            self.critic_observations = torch.zeros(
+                horizon, total_agents, critic_vec.obs_size,
+                dtype=obs_dtype, device=device)
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
         self.total_epochs = max(1, config['total_timesteps'] // self.batch_size)
 
         self.policy = policy
+        optim_params = list(self.policy.parameters())
+        if self.critic is not None:
+            optim_params += list(self.critic.parameters())
         self.optimizer = Muon(
-            self.policy.parameters(),
+            optim_params,
             lr=config['learning_rate'],
             momentum=config['beta1'],
             eps=config['eps'],
@@ -182,6 +319,8 @@ class PuffeRL:
         self.verbose = verbose
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        if self.critic is not None:
+            self.model_size += sum(p.numel() for p in self.critic.parameters() if p.requires_grad)
         if verbose:
             pufferlib.pufferl.print_dashboard(args, self.model_size, {}, clear=True)
 
@@ -207,7 +346,10 @@ class PuffeRL:
         horizon = config['horizon']
 
         self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
+        if self.critic is not None and self.critic_state:
+            self.critic_state = tuple(torch.zeros_like(s) for s in self.critic_state)
         o = self.vec_obs
+        co = self.critic_vec_obs
         r = torch.zeros(self.total_agents, device=device)
         d = torch.zeros(self.total_agents, device=device)
 
@@ -215,16 +357,23 @@ class PuffeRL:
         prof.mark(0)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
+            co_device = torch.as_tensor(co, device=device) if self.critic is not None else None
 
             prof.mark(1)
             with torch.no_grad():
                 logits, value, state = self.policy.forward_eval(o_device, self.state)
+                if self.critic is not None:
+                    value, critic_state = self.critic.forward_eval(co_device, self.critic_state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
             with torch.no_grad():
                 self.state = state
+                if self.critic is not None:
+                    self.critic_state = critic_state
                 self.observations[t] = o_device
+                if self.critic is not None:
+                    self.critic_observations[t] = co_device
                 self.actions[t] = action
                 self.logprobs[t] = logprob
                 self.rewards[t] = torch.as_tensor(r, device=device)
@@ -236,11 +385,16 @@ class PuffeRL:
             if self.gpu:
                 actions_flat = actions_flat.cuda()
                 self._vec.gpu_step(actions_flat.data_ptr())
+                if self.critic_vec is not None:
+                    self.critic_vec.gpu_step(actions_flat.data_ptr())
                 torch.cuda.synchronize()
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())
+                if self.critic_vec is not None:
+                    self.critic_vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
+            co = self.critic_vec_obs
             prof.mark(3)
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
@@ -272,6 +426,11 @@ class PuffeRL:
 
         # Transpose from [horizon, agents] (contiguous writes) to [agents, horizon] (minibatch indexing)
         obs = self.observations.transpose(0, 1).contiguous()
+        critic_obs = (
+            self.critic_observations.transpose(0, 1).contiguous()
+            if self.critic is not None
+            else None
+        )
         act = self.actions.transpose(0, 1).contiguous()
         val = self.values.T.contiguous()
         lp = self.logprobs.T.contiguous()
@@ -296,6 +455,7 @@ class PuffeRL:
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
+            mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
             mb_logprobs = lp[idx]
             mb_values = val[idx]
@@ -304,6 +464,8 @@ class PuffeRL:
 
             prof.mark(1)
             logits, newvalue = self.policy(mb_obs)
+            if self.critic is not None:
+                newvalue = self.critic(mb_critic_obs)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
@@ -391,9 +553,22 @@ class PuffeRL:
         torch.save(self.policy.state_dict(), path)
 
     def load_weights(self, path):
-        state_dict = torch.load(path, map_location=self.device)
+        try:
+            state_dict = torch.load(path, map_location=self.device)
+        except Exception as exc:
+            try:
+                self._load_native_raw_float_weights(path)
+            except Exception as native_exc:
+                raise native_exc from exc
+            return
+
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         self.policy.load_state_dict(state_dict)
+
+    def _load_native_raw_float_weights(self, path):
+        _load_native_raw_float_weights(self.policy, path, self.device)
 
     def render(self, env_id=0):
         self._vec.render(env_id)
@@ -402,6 +577,10 @@ class PuffeRL:
         self.vec_obs = None
         self.vec_rewards = None
         self.vec_terminals = None
+        if self.critic_vec is not None:
+            self.critic_vec_obs = None
+            self.critic_vec.close()
+            self.critic_vec = None
         self._vec.close()
 
     @classmethod
@@ -482,6 +661,11 @@ def load_policy(args, vec):
     network = network_cls(**policy_kwargs)
     encoder = encoder_cls(vec.obs_size, policy_kwargs['hidden_size'])
     decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
+    if hasattr(decoder, 'decoder_logstd'):
+        action_std = float(args['train'].get('action_std', 1.0))
+        if action_std <= 0:
+            raise ValueError(f'action_std must be positive, got {action_std}')
+        decoder.decoder_logstd.data.fill_(float(np.log(action_std)))
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
     device = 'cuda' if _C.gpu else 'cpu'
@@ -508,9 +692,16 @@ def load_policy(args, vec):
         load_path = max(candidates, key=os.path.getctime)
 
     if load_path is not None:
-        state_dict = torch.load(load_path, map_location=device)
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        policy.load_state_dict(state_dict)
+        try:
+            state_dict = torch.load(load_path, map_location=device)
+            if "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            policy.load_state_dict(state_dict)
+        except Exception as exc:
+            try:
+                _load_native_raw_float_weights(policy, load_path, device)
+            except Exception as native_exc:
+                raise native_exc from exc
 
     return policy
-

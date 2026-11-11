@@ -54,27 +54,39 @@ fi
 PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
-    OMP_LIB=-lomp5
+    OPENMP_CFLAGS=(-fopenmp)
+    OPENMP_LDFLAGS=(-fopenmp)
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
-    OMP_LIB=-lomp
+    OPENMP_CFLAGS=(-Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include)
+    OPENMP_LDFLAGS=(-L/opt/homebrew/opt/libomp/lib -lomp)
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
 fi
 
-CLANG_WARN=(
-    -Wall
-    -ferror-limit=3
-    -Werror=incompatible-pointer-types
-    -Werror=return-type
-    -Wno-error=incompatible-pointer-types-discards-qualifiers
-    -Wno-incompatible-pointer-types-discards-qualifiers
-    -Wno-error=array-parameter
-)
+if [ "$PLATFORM" = "Linux" ]; then
+    CLANG_WARN=(
+        -Wall
+        -fmax-errors=3
+        -Werror=incompatible-pointer-types
+        -Werror=return-type
+        -Wno-error=array-parameter
+    )
+else
+    CLANG_WARN=(
+        -Wall
+        -ferror-limit=3
+        -Werror=incompatible-pointer-types
+        -Werror=return-type
+        -Wno-error=incompatible-pointer-types-discards-qualifiers
+        -Wno-incompatible-pointer-types-discards-qualifiers
+        -Wno-error=array-parameter
+    )
+fi
 
 download() {
     local name=$1 url=$2
@@ -142,8 +154,11 @@ OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 
 # Standalone environment build
 # -mavx2 enables AVX2 intrinsics (__m256, _mm256_*) which drive.h and
-# src/bf16.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
-SIMD_FLAGS=(-mavx2 -mfma)
+# src/bf16.h use directly. Keep it off ARM/Apple Silicon.
+SIMD_FLAGS=()
+if [ "$(uname -m)" = "x86_64" ]; then
+    SIMD_FLAGS=(-mavx2 -mfma)
+fi
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}" "${SIMD_FLAGS[@]}")
     NVCC_OPT="-O0 -g"
@@ -160,7 +175,8 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread
+        "${OPENMP_CFLAGS[@]}" "${OPENMP_LDFLAGS[@]}"
         -DPLATFORM_DESKTOP
     )
     echo "Compiling $ENV..."
@@ -228,8 +244,60 @@ if [ -z "$NCCL_LFLAG" ]; then
     NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
+lib_dir_from_flag() {
+    local flag="$1"
+    if [[ "$flag" == -L* ]]; then
+        echo "${flag#-L}"
+    fi
+}
+
+versioned_or_lflag_lib() {
+    local lflag="$1"
+    local name="$2"
+    local dir
+    dir="$(lib_dir_from_flag "$lflag")"
+    if [ -z "$dir" ]; then
+        echo "-l$name"
+        return
+    fi
+    if [ -f "$dir/lib$name.so" ]; then
+        echo "-l$name"
+        return
+    fi
+    local path
+    path="$(find "$dir" -maxdepth 1 -name "lib$name.so*" -type f | sort -V | head -n 1)"
+    if [ -n "$path" ]; then
+        echo "$path"
+    else
+        echo "-l$name"
+    fi
+}
+
+find_system_lib() {
+    local name="$1"
+    local dir path
+    for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
+        if [ -f "$dir/lib$name.so" ]; then
+            echo "-L$dir|-l$name"
+            return
+        fi
+        path="$(find "$dir" -maxdepth 1 -name "lib$name.so*" -type f 2>/dev/null | sort -V | head -n 1)"
+        if [ -n "$path" ]; then
+            echo "|$path"
+            return
+        fi
+    done
+    echo "|-l$name"
+}
+
+CUDNN_LIB_ARG="$(versioned_or_lflag_lib "$CUDNN_LFLAG" cudnn)"
+NCCL_LIB_ARG="$(versioned_or_lflag_lib "$NCCL_LFLAG" nccl)"
+NVIDIA_ML_RESOLVED="$(find_system_lib nvidia-ml)"
+NVIDIA_ML_LFLAG="${NVIDIA_ML_RESOLVED%%|*}"
+NVIDIA_ML_LIB_ARG="${NVIDIA_ML_RESOLVED#*|}"
+
 WHEEL_RPATH_FLAGS=()
-for lib_flag in "$CUDNN_LFLAG" "$NCCL_LFLAG"; do
+for lib_flag in "$CUDNN_LFLAG" "$NCCL_LFLAG" "$NVIDIA_ML_LFLAG"; do
     if [[ "$lib_flag" == -L* ]]; then
         WHEEL_RPATH_FLAGS+=("-Wl,-rpath,${lib_flag#-L}")
     fi
@@ -238,8 +306,13 @@ done
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
-NVCC="ccache $CUDA_HOME/bin/nvcc"
-CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
+if command -v ccache >/dev/null; then
+    NVCC="ccache $CUDA_HOME/bin/nvcc"
+    CC="${CC:-ccache clang}"
+else
+    NVCC="$CUDA_HOME/bin/nvcc"
+    CC="${CC:-clang}"
+fi
 ARCH=${NVCC_ARCH:-native}
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
@@ -265,7 +338,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    -fPIC "${OPENMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -293,13 +366,13 @@ if [ -z "$MODE" ]; then
         src/bindings.cu -o build/bindings.o
 
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC
         build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
-        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
+        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG $NVIDIA_ML_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
-        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
-        $OMP_LIB $LINK_OPT
+        -lcudart "$NCCL_LIB_ARG" "$NVIDIA_ML_LIB_ARG" -lcublas -lcusolver -lcurand "$CUDNN_LIB_ARG"
+        "${OPENMP_LDFLAGS[@]}" $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
     )
@@ -308,7 +381,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC "${OPENMP_CFLAGS[@]}" \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -319,10 +392,10 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC
         build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         "${EXTRA_LDFLAGS[@]}"
-        -lm -lpthread $OMP_LIB $LINK_OPT
+        -lm -lpthread "${OPENMP_LDFLAGS[@]}" $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
     )
@@ -341,8 +414,8 @@ elif [ "$MODE" = "profile" ]; then
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu vendor/ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
-        -lGL -lm -lpthread $OMP_LIB \
+        "$NCCL_LIB_ARG" "$NVIDIA_ML_LIB_ARG" -lcublas -lcurand "$CUDNN_LIB_ARG" \
+        -lGL -lm -lpthread "${OPENMP_LDFLAGS[@]}" \
         -o profile
     echo "Built: ./profile"
 fi

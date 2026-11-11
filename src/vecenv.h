@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
@@ -52,11 +53,22 @@ static inline DictItem* dict_get(Dict* dict, const char* key) {
 }
 
 static inline void dict_set(Dict* dict, const char* key, double value) {
-    assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
     if (item != NULL) {
         item->value = value;
         return;
+    }
+    if (dict->size >= dict->capacity) {
+        int next_capacity = dict->capacity > 0 ? 2 * dict->capacity : 16;
+        DictItem* next_items = (DictItem*)realloc(
+            dict->items, (size_t)next_capacity * sizeof(DictItem));
+        assert(next_items != NULL);
+        memset(
+            next_items + dict->capacity,
+            0,
+            (size_t)(next_capacity - dict->capacity) * sizeof(DictItem));
+        dict->items = next_items;
+        dict->capacity = next_capacity;
     }
     dict->items[dict->size].key = key;
     dict->items[dict->size].value = value;
@@ -122,6 +134,9 @@ void static_vec_omp_step(StaticVec* vec);
 void static_vec_seq_step(StaticVec* vec);
 void static_vec_render(StaticVec* vec, int env_id);
 void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]);
+size_t static_vec_env_state_size(StaticVec* vec);
+int static_vec_get_env_state(StaticVec* vec, int env_id, void* out, size_t nbytes);
+int static_vec_set_env_state(StaticVec* vec, int env_id, const void* in, size_t nbytes);
 
 // Env info
 int get_obs_size(void);
@@ -728,6 +743,80 @@ void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]) {
 void static_vec_render(StaticVec* vec, int env_id) {
     Env* envs = (Env*)vec->envs;
     c_render(&envs[env_id]);
+}
+
+size_t static_vec_env_state_size(StaticVec* vec) {
+    (void)vec;
+    return sizeof(Env) + 2 * sizeof(float);
+}
+
+int static_vec_get_env_state(StaticVec* vec, int env_id, void* out, size_t nbytes) {
+    if (vec == NULL || out == NULL || env_id < 0 || env_id >= vec->size)
+        return 0;
+
+    size_t state_size = static_vec_env_state_size(vec);
+    if (nbytes != state_size)
+        return 0;
+
+    Env* envs = (Env*)vec->envs;
+    Env* env = &envs[env_id];
+    char* dst = (char*)out;
+    memcpy(dst, env, sizeof(Env));
+    dst += sizeof(Env);
+    memcpy(dst, env->rewards, sizeof(float));
+    dst += sizeof(float);
+    memcpy(dst, env->terminals, sizeof(float));
+    return 1;
+}
+
+int static_vec_set_env_state(StaticVec* vec, int env_id, const void* in, size_t nbytes) {
+    if (vec == NULL || in == NULL || env_id < 0 || env_id >= vec->size)
+        return 0;
+
+    size_t state_size = static_vec_env_state_size(vec);
+    if (nbytes != state_size)
+        return 0;
+
+    Env* envs = (Env*)vec->envs;
+    Env* env = &envs[env_id];
+    void* observations = env->observations;
+    float* actions = env->actions;
+    float* rewards = env->rewards;
+    float* terminals = env->terminals;
+#ifdef MY_ACTION_MASK
+    unsigned char* action_mask = env->action_mask;
+#endif
+
+    const char* src = (const char*)in;
+    memcpy(env, src, sizeof(Env));
+    env->observations = observations;
+    env->actions = actions;
+    env->rewards = rewards;
+    env->terminals = terminals;
+#ifdef MY_ACTION_MASK
+    env->action_mask = action_mask;
+#endif
+    src += sizeof(Env);
+    memcpy(env->rewards, src, sizeof(float));
+    src += sizeof(float);
+    memcpy(env->terminals, src, sizeof(float));
+    compute_observations(env);
+
+    if (vec->gpu) {
+        size_t obs_elem_size = obs_element_size();
+        ptrdiff_t obs_offset = (char*)env->observations - (char*)vec->observations;
+        ptrdiff_t reward_offset = env->rewards - vec->rewards;
+        ptrdiff_t terminal_offset = env->terminals - vec->terminals;
+        cudaMemcpy((char*)vec->gpu_observations + obs_offset,
+            env->observations, OBS_SIZE * obs_elem_size, cudaMemcpyHostToDevice);
+        cudaMemcpy(vec->gpu_rewards + reward_offset,
+            env->rewards, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(vec->gpu_terminals + terminal_offset,
+            env->terminals, sizeof(float), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+    }
+
+    return 1;
 }
 
 int get_obs_size(void) { return OBS_SIZE; }

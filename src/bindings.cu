@@ -109,7 +109,7 @@ pybind11::dict puf_eval_log(pybind11::object pufferl_obj) {
     pybind11::dict env_dict;
     // Capacity 64 to fit chess's per-bank hist_score_bank/hist_n_bank entries
     // (16 keys across 8 banks) on top of base env-log fields.
-    Dict* env_out = create_dict(64);
+    Dict* env_out = create_dict(128);
     static_vec_eval_log(pufferl.vec, env_out);
     for (int i = 0; i < env_out->size; i++) {
         env_dict[env_out->items[i].key] = env_out->items[i].value;
@@ -179,18 +179,20 @@ void puf_close(pybind11::object pufferl_obj) {
 
 void save_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
-    std::vector<char> buf(nbytes);
-    cudaMemcpy(buf.data(), pufferl.master_weights.data, nbytes, cudaMemcpyDeviceToHost);
+    int64_t nweights = numel(pufferl.master_weights.shape);
+    std::vector<float> buf(nweights);
+    cudaMemcpy(buf.data(), pufferl.master_weights.data,
+        nweights * sizeof(float), cudaMemcpyDeviceToHost);
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
-    fwrite(buf.data(), 1, nbytes, f);
+    fwrite(buf.data(), sizeof(float), nweights, f);
     fclose(f);
 }
 
 void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
+    int64_t nweights = numel(pufferl.master_weights.shape);
+    int64_t nbytes = nweights * sizeof(float);
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
     // Verify file size matches
@@ -202,9 +204,9 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         throw std::runtime_error("Weight file size mismatch: expected " +
             std::to_string(nbytes) + " bytes, got " + std::to_string(file_size));
     }
-    std::vector<char> buf(nbytes);
-    size_t nread = fread(buf.data(), 1, nbytes, f);
-    if ((int64_t)nread != nbytes) {
+    std::vector<float> buf(nweights);
+    size_t nread = fread(buf.data(), sizeof(float), nweights, f);
+    if ((int64_t)nread != nweights) {
         fclose(f);
         throw std::runtime_error("Failed to read weight file");
     }
@@ -370,7 +372,7 @@ void cpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
 }
 
 py::dict vec_log(VecEnv& ve) {
-    Dict* out = create_dict(32);
+    Dict* out = create_dict(128);
     static_vec_log(ve.vec, out);
     py::dict result;
     for (int i = 0; i < out->size; i++) {
@@ -379,6 +381,26 @@ py::dict vec_log(VecEnv& ve) {
     free(out->items);
     free(out);
     return result;
+}
+
+py::bytes vec_snapshot(VecEnv& ve, int env_id) {
+    size_t nbytes = static_vec_env_state_size(ve.vec);
+    std::string bytes(nbytes, '\0');
+    if (!static_vec_get_env_state(ve.vec, env_id, bytes.data(), nbytes)) {
+        throw std::runtime_error("failed to snapshot env state");
+    }
+    return py::bytes(bytes);
+}
+
+void vec_restore(VecEnv& ve, int env_id, py::bytes snapshot) {
+    std::string bytes = snapshot.cast<std::string>();
+    size_t nbytes = static_vec_env_state_size(ve.vec);
+    if (bytes.size() != nbytes) {
+        throw std::runtime_error("env snapshot size mismatch");
+    }
+    if (!static_vec_set_env_state(ve.vec, env_id, bytes.data(), nbytes)) {
+        throw std::runtime_error("failed to restore env state");
+    }
 }
 
 void vec_close(VecEnv& ve) {
@@ -391,6 +413,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     py::dict vec_kwargs = args["vec"].cast<py::dict>();
     py::dict env_kwargs = args["env"].cast<py::dict>();
     py::dict policy_kwargs = args["policy"].cast<py::dict>();
+    py::dict torch_kwargs = args["torch"].cast<py::dict>();
 
     HypersT hypers;
     // Layout (total_agents and num_buffers come from vec config)
@@ -401,6 +424,8 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
     hypers.num_layers = get_config(policy_kwargs, "num_layers");
+    hypers.use_bias = get_config(policy_kwargs, "use_bias");
+    hypers.network_name = torch_kwargs["network"].cast<std::string>();
     // Learning rate
     hypers.lr = get_config(train_kwargs, "learning_rate");
     hypers.min_lr_ratio = get_config(train_kwargs, "min_lr_ratio");
@@ -414,6 +439,9 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.replay_ratio = get_config(train_kwargs, "replay_ratio");
     hypers.total_timesteps = get_config(train_kwargs, "total_timesteps");
     hypers.max_grad_norm = get_config(train_kwargs, "max_grad_norm");
+    hypers.action_std = get_config(train_kwargs, "action_std");
+    hypers.train_action_std = get_config(train_kwargs, "train_action_std");
+    hypers.reward_clip = get_config(train_kwargs, "reward_clip");
     // PPO
     hypers.clip_coef = get_config(train_kwargs, "clip_coef");
     hypers.vf_clip_coef = get_config(train_kwargs, "vf_clip_coef");
@@ -538,9 +566,10 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("num_buffers", &HypersT::num_buffers)
         .def_readwrite("num_atns", &HypersT::num_atns)
         .def_readwrite("hidden_size", &HypersT::hidden_size)
-
         .def_readwrite("replay_ratio", &HypersT::replay_ratio)
         .def_readwrite("num_layers", &HypersT::num_layers)
+        .def_readwrite("use_bias", &HypersT::use_bias)
+        .def_readwrite("network_name", &HypersT::network_name)
         .def_readwrite("lr", &HypersT::lr)
         .def_readwrite("min_lr_ratio", &HypersT::min_lr_ratio)
         .def_readwrite("anneal_lr", &HypersT::anneal_lr)
@@ -561,6 +590,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("vtrace_c_clip", &HypersT::vtrace_c_clip)
         .def_readwrite("prio_alpha", &HypersT::prio_alpha)
         .def_readwrite("prio_beta0", &HypersT::prio_beta0)
+        .def_readwrite("train_action_std", &HypersT::train_action_std)
         .def_readwrite("cudagraphs", &HypersT::cudagraphs)
         .def_readwrite("profile", &HypersT::profile)
         .def_readwrite("rank", &HypersT::rank)
@@ -615,6 +645,8 @@ PYBIND11_MODULE(_C, m) {
         .def("cpu_step", &cpu_vec_step_py)
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log",   &vec_log)
+        .def("snapshot", &vec_snapshot, py::arg("env_id") = 0)
+        .def("restore", &vec_restore, py::arg("env_id"), py::arg("snapshot"))
         .def("close", &vec_close);
 
     m.def("create_pufferl", &create_pufferl);

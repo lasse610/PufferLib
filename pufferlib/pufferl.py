@@ -177,9 +177,28 @@ def _resolve_backend(args):
         return PuffeRL
     return _C
 
+def _resolve_load_path(args, load_path=None):
+    load_path = load_path or args.get('load_model_path')
+    if load_path == 'latest':
+        checkpoint_dir = args['checkpoint_dir']
+        pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
+        candidates = glob.glob(pattern, recursive=True)
+        if not candidates:
+            raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
+        load_path = max(candidates, key=os.path.getctime)
+    return load_path
+
+def _load_weights_if_requested(backend, pufferl, args, load_path=None):
+    load_path = _resolve_load_path(args, load_path)
+    if load_path is not None:
+        backend.load_weights(pufferl, load_path)
+        print(f'Loaded weights from {load_path}')
+    return load_path
+
 def _train_worker(args):
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
+    _load_weights_if_requested(backend, pufferl, args)
     args.pop('nccl_id', None)
     while pufferl.global_step < args['train']['total_timesteps']:
         backend.rollouts(pufferl)
@@ -218,6 +237,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     try:
         pufferl = backend.create_pufferl(args)
+        _load_weights_if_requested(backend, pufferl, args)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
         if result_queue is not None:
@@ -474,19 +494,7 @@ def eval(env_name, args=None, load_path=None):
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
 
-    # Resolve load path
-    load_path = load_path or args.get('load_model_path')
-    if load_path == 'latest':
-        checkpoint_dir = args['checkpoint_dir']
-        pattern = os.path.join(checkpoint_dir, args['env_name'], '**', '*.bin')
-        candidates = glob.glob(pattern, recursive=True)
-        if not candidates:
-            raise FileNotFoundError(f'No .bin checkpoints found in {checkpoint_dir}/{args["env_name"]}/')
-        load_path = max(candidates, key=os.path.getctime)
-
-    if load_path is not None:
-        backend.load_weights(pufferl, load_path)
-        print(f'Loaded weights from {load_path}')
+    _load_weights_if_requested(backend, pufferl, args, load_path)
 
     while True:
         backend.render(pufferl, 0)

@@ -158,7 +158,7 @@ checkpoints/
 experiments/
 wandb/
 .neptune/
-raylib*/
+raylib*
 box2d*/
 
 # Temp Impulse Wars files
@@ -171,4 +171,3 @@ pufferlib/ocean/impulse_wars/benchmark/
 # Data
 resources/drive/data/*
 resources/drive/binaries/*
-

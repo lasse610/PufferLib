@@ -151,6 +151,26 @@ static py::dict vec_log(VecEnv& ve) {
     return result;
 }
 
+static py::bytes vec_snapshot(VecEnv& ve, int env_id) {
+    size_t nbytes = static_vec_env_state_size(ve.vec);
+    std::string bytes(nbytes, '\0');
+    if (!static_vec_get_env_state(ve.vec, env_id, bytes.data(), nbytes)) {
+        throw std::runtime_error("failed to snapshot env state");
+    }
+    return py::bytes(bytes);
+}
+
+static void vec_restore(VecEnv& ve, int env_id, py::bytes snapshot) {
+    std::string bytes = snapshot.cast<std::string>();
+    size_t nbytes = static_vec_env_state_size(ve.vec);
+    if (bytes.size() != nbytes) {
+        throw std::runtime_error("env snapshot size mismatch");
+    }
+    if (!static_vec_set_env_state(ve.vec, env_id, bytes.data(), nbytes)) {
+        throw std::runtime_error("failed to restore env state");
+    }
+}
+
 static void vec_close(VecEnv& ve) {
     static_vec_close(ve.vec);
     ve.vec = nullptr;
@@ -183,5 +203,7 @@ PYBIND11_MODULE(_C, m) {
         .def("cpu_step", &cpu_vec_step_py)
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log", &vec_log)
+        .def("snapshot", &vec_snapshot, py::arg("env_id") = 0)
+        .def("restore", &vec_restore, py::arg("env_id"), py::arg("snapshot"))
         .def("close", &vec_close);
 }

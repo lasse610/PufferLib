@@ -4,6 +4,7 @@
 #include <nvml.h>
 #include <nccl.h>
 #include <vector>
+#include <math.h>
 
 #include <time.h>
 #include "models.cu"
@@ -266,6 +267,8 @@ typedef struct {
     int num_atns;
     int hidden_size;
     int num_layers;
+    bool use_bias;
+    std::string network_name;
     // Learning rate
     float lr;
     float min_lr_ratio;
@@ -298,6 +301,9 @@ typedef struct {
     // Priority
     float prio_alpha;
     float prio_beta0;
+    float action_std;
+    bool train_action_std;
+    float reward_clip;
     // Flags
     bool reset_state;
     int cudagraphs;
@@ -385,9 +391,7 @@ typedef struct {
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
-    // Capacity raised from 32 to 64 to accommodate chess's per-bank
-    // hist_score_bank_<b> / hist_n_bank_<b> entries (16 keys for 8 banks).
-    Dict* out = create_dict(64);
+    Dict* out = create_dict(128);
     static_vec_log(pufferl.vec, out);
     return out;
 }
@@ -1506,9 +1510,13 @@ void train_impl(PuffeRL& pufferl) {
             rollouts.action_mask.data, src.action_mask.data, T, B, mask_size);
     }
 
-    // We hard-clamp rewards to -1, 1. Our envs are mostly designed to respect this range
-    clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.rewards.data, -1.0f, 1.0f, numel(rollouts.rewards.shape));
+    // Most upstream 4.0 envs are designed for [-1, 1] reward clipping. Some
+    // ported envs use calibrated larger-magnitude rewards, so make it opt-out.
+    if (hypers.reward_clip > 0.0f) {
+        clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
+            rollouts.rewards.data, -hypers.reward_clip, hypers.reward_clip,
+            numel(rollouts.rewards.shape));
+    }
 
     // Set importance weights to 1.0
     fill_precision_kernel<<<grid_size(numel(rollouts.ratio.shape)), BLOCK_SIZE, 0, train_stream>>>(
@@ -1611,7 +1619,10 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
 
             FloatTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
-            FloatTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : FloatTensor();
+            FloatTensor grad_logstd_puf =
+                (pufferl.is_continuous && hypers.train_action_std)
+                    ? pufferl.ppo_bufs_puf.grad_logstd
+                    : FloatTensor();
             FloatTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
@@ -1678,7 +1689,8 @@ void train_impl(PuffeRL& pufferl) {
 // has no heap state so this returns by value; callers store it wherever.
 static Policy build_policy(const char* env_name, int input_size, int hidden_size,
                            int num_layers, int decoder_output_size, int act_n,
-                           bool is_continuous, int horizon) {
+                           bool is_continuous, int horizon,
+                           const std::string& network_name, bool use_bias) {
     Encoder encoder = {
         .forward = encoder_forward,
         .backward = encoder_backward,
@@ -1689,7 +1701,7 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .create_weights = encoder_create_weights,
         .free_weights = encoder_free_weights,
         .free_activations = encoder_free_activations,
-        .in_dim = input_size, .out_dim = hidden_size,
+        .in_dim = input_size, .out_dim = hidden_size, .use_bias = use_bias,
         .activation_size = sizeof(EncoderActivations),
     };
     create_custom_encoder(env_name, &encoder);
@@ -1703,21 +1715,61 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .create_weights = decoder_create_weights,
         .free_weights = decoder_free_weights,
         .free_activations = decoder_free_activations,
-        .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
+        .hidden_dim = hidden_size, .output_dim = decoder_output_size,
+        .continuous = is_continuous, .use_bias = use_bias,
     };
-    Network network = {
-        .forward = mingru_forward,
-        .forward_train = mingru_forward_train,
-        .backward = mingru_backward,
-        .init_weights = mingru_init_weights,
-        .reg_params = mingru_reg_params,
-        .reg_train = mingru_reg_train,
-        .reg_rollout = mingru_reg_rollout,
-        .create_weights = mingru_create_weights,
-        .free_weights = mingru_free_weights,
-        .free_activations = mingru_free_activations,
-        .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
-    };
+    Network network;
+    if (network_name == "GELU") {
+        network = {
+            .forward = gelu_network_forward,
+            .forward_train = gelu_network_forward_train,
+            .backward = gelu_network_backward,
+            .init_weights = gelu_network_init_weights,
+            .reg_params = gelu_network_reg_params,
+            .reg_train = gelu_network_reg_train,
+            .reg_rollout = gelu_network_reg_rollout,
+            .create_weights = gelu_network_create_weights,
+            .free_weights = gelu_network_free_weights,
+            .free_activations = gelu_network_free_activations,
+            .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+            .use_bias = use_bias,
+            .activation_size = sizeof(GELUActivations),
+        };
+    } else if (network_name == "MLP") {
+        network = {
+            .forward = mlp_forward,
+            .forward_train = mlp_forward_train,
+            .backward = mlp_backward,
+            .init_weights = mlp_init_weights,
+            .reg_params = mlp_reg_params,
+            .reg_train = mlp_reg_train,
+            .reg_rollout = mlp_reg_rollout,
+            .create_weights = mlp_create_weights,
+            .free_weights = mlp_free_weights,
+            .free_activations = mlp_free_activations,
+            .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+            .use_bias = use_bias,
+            .activation_size = sizeof(MLPActivations),
+        };
+    } else if (network_name == "MinGRU") {
+        network = {
+            .forward = mingru_forward,
+            .forward_train = mingru_forward_train,
+            .backward = mingru_backward,
+            .init_weights = mingru_init_weights,
+            .reg_params = mingru_reg_params,
+            .reg_train = mingru_reg_train,
+            .reg_rollout = mingru_reg_rollout,
+            .create_weights = mingru_create_weights,
+            .free_weights = mingru_free_weights,
+            .free_activations = mingru_free_activations,
+            .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+            .use_bias = use_bias,
+            .activation_size = sizeof(MinGRUActivations),
+        };
+    } else {
+        throw std::runtime_error("Unsupported native network: " + network_name);
+    }
     return Policy{
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
@@ -1740,7 +1792,8 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
     for (int i = 0; i < num_action_heads; i++) act_n += raw_act_sizes[i];
     int decoder_output_size = pufferl->is_continuous ? num_action_heads : act_n;
     bank->policy = build_policy(pufferl->env_name.c_str(), input_size, hidden_size,
-        num_layers, decoder_output_size, act_n, pufferl->is_continuous, pufferl->hypers.horizon);
+        num_layers, decoder_output_size, act_n, pufferl->is_continuous,
+        pufferl->hypers.horizon, pufferl->hypers.network_name, pufferl->hypers.use_bias);
     bank->hidden_size = hidden_size;
     bank->num_layers = num_layers;
 
@@ -1979,7 +2032,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int num_buffers = hypers.num_buffers;
 
     pufferl->policy = build_policy(env_name.c_str(), input_size, hidden_size,
-        num_layers, decoder_output_size, act_n, is_continuous, hypers.horizon);
+        num_layers, decoder_output_size, act_n, is_continuous, hypers.horizon,
+        hypers.network_name, hypers.use_bias);
 
     // Create and allocate params
     Allocator* params = &pufferl->params_alloc;
@@ -2045,6 +2099,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     ulong init_seed = hypers.seed;
     policy_init_weights(&pufferl->policy, pufferl->weights, &init_seed, pufferl->default_stream);
+    if (pufferl->is_continuous && hypers.action_std > 0.0f) {
+        DecoderWeights* decoder = (DecoderWeights*)pufferl->weights.decoder;
+        fill_precision_kernel<<<grid_size(numel(decoder->logstd.shape)), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+            decoder->logstd.data, from_float(logf(hypers.action_std)), numel(decoder->logstd.shape));
+    }
     pufferl->master_weights = {.data = (float*)pufferl->param_puf.data, .shape = {params->total_elems}};
     if (USE_BF16) {
         pufferl->master_weights = {.shape = {params->total_elems}};
@@ -2201,9 +2260,15 @@ void close_impl(PuffeRL& pufferl) {
         cudaProfilerStop();
     }
 
-    cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    if (pufferl.train_cudagraph != nullptr) {
+        cudaGraphExecDestroy(pufferl.train_cudagraph);
+    }
+    if (pufferl.fused_rollout_cudagraphs != nullptr) {
+        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+            if (pufferl.fused_rollout_cudagraphs[i] != nullptr) {
+                cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+            }
+        }
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);

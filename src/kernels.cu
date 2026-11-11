@@ -268,9 +268,14 @@ static inline void cublasGemmExDense(
 
     cublasHandle_t handle = cublas_get_handle();
     cublasSetStream(handle, stream);
-    cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
+    cublasStatus_t status = cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
         B, CUBLAS_PRECISION, ldb, A, CUBLAS_PRECISION, lda, &beta,
         C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+            "cublasGemmEx failed status=%d M=%d N=%d K=%d op_a=%d op_b=%d lda=%d ldb=%d\n",
+            (int)status, M, N, K, (int)op_a, (int)op_b, lda, ldb);
+    }
 }
 
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
@@ -317,12 +322,18 @@ __global__ void cast(precision_t* __restrict__ dst,
     }
 }
 
+#ifdef PRECISION_FLOAT
+inline void cast_dispatch(precision_t* dst, const float* src, int n, cudaStream_t stream) {
+    cudaMemcpyAsync(dst, src, n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
+}
+#else
 inline void cast_dispatch(precision_t* dst, const precision_t* src, int n, cudaStream_t stream) {
     cudaMemcpyAsync(dst, src, n * sizeof(precision_t), cudaMemcpyDeviceToDevice, stream);
 }
 inline void cast_dispatch(precision_t* dst, const float* src, int n, cudaStream_t stream) {
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, src, n);
 }
+#endif
 
 #ifndef PRECISION_FLOAT
 __global__ void cast(float* __restrict__ dst,
@@ -383,11 +394,13 @@ void puf_kaiming_init(PrecisionTensor* dst, float gain, ulong seed, cudaStream_t
     cudaMalloc(&buf, n * sizeof(float));
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetStream(gen, stream);
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateUniform(gen, buf, n);
-    curandDestroyGenerator(gen);
     uniform_scale_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(buf, bound, n);
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cudaStreamSynchronize(stream);
+    curandDestroyGenerator(gen);
     cudaFree(buf);
 }
 
@@ -400,10 +413,12 @@ void puf_normal_init(PrecisionTensor* dst, float std, ulong seed, cudaStream_t s
     cudaMalloc(&buf, rand_count * sizeof(float));
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetStream(gen, stream);
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandGenerateNormal(gen, buf, rand_count, 0.0f, std);
-    curandDestroyGenerator(gen);
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst->data, buf, n);
+    cudaStreamSynchronize(stream);
+    curandDestroyGenerator(gen);
     cudaFree(buf);
 }
 
@@ -426,7 +441,7 @@ static void alloc_register_impl(Allocator* alloc, void** data_ptr, int64_t* shap
     alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
     int64_t n = numel(shape);
     alloc->total_elems += n;
-    alloc->total_bytes = (alloc->total_bytes + 15) & ~15;
+    alloc->total_bytes = (alloc->total_bytes + 31) & ~31;
     alloc->total_bytes += n * elem_size;
 }
 void alloc_register(Allocator* a, PrecisionTensor* t) {
@@ -449,7 +464,7 @@ cudaError_t alloc_create(Allocator* alloc) {
     cudaMemset(alloc->mem, 0, alloc->total_bytes);
     long offset = 0;
     for (int i = 0; i < alloc->num_regs; i++) {
-        offset = (offset + 15) & ~15;
+        offset = (offset + 31) & ~31;
         *alloc->regs[i].data_ptr = (char*)alloc->mem + offset;
         offset += numel(alloc->regs[i].shape) * alloc->regs[i].elem_size;
     }

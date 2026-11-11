@@ -584,6 +584,7 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .free_weights = nmmo3_encoder_free_weights,
             .free_activations = nmmo3_encoder_free_activations,
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+            .use_bias = false,
             .activation_size = sizeof(NMMO3EncoderActivations),
         };
     }
